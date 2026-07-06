@@ -132,9 +132,10 @@ display_cols = [
 ]
 st.dataframe(
     f[display_cols].sort_values("DailyAvgLoad", ascending=False).style.format({
-        "MonthlyTarget": "{:,.0f}", "DailyAvgLoad": "{:,.0f}", "TruckCaseCapacity": "{:,.0f}",
+        "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "DailyAvgLoad": "{:,.0f}",
+        "RecommendedTruckTonnage": "{:,.0f}", "TruckCaseCapacity": "{:,.0f}",
         "TrucksPerDay": "{:,.0f}", "TrucksPerMonth (truck-trips)": "{:,.0f}"
-    }),
+    }, na_rep="—"),
     use_container_width=True, height=420
 )
 

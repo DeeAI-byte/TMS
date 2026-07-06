@@ -176,9 +176,10 @@ display_cols = [
 ]
 st.dataframe(
     f[display_cols].sort_values("MonthlyTarget", ascending=False).style.format({
-        "MonthlyTarget": "{:,.0f}", "TripsPerMonth": "{:,.0f}", "LoadPerTrip": "{:,.0f}",
+        "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "TripsPerMonth": "{:,.0f}",
+        "LoadPerTrip": "{:,.0f}", "RecommendedTruckTonnage": "{:,.0f}",
         "TruckCaseCapacity": "{:,.0f}", "TrucksPerTrip": "{:,.0f}", "TotalTruckTripsPerMonth": "{:,.0f}"
-    }),
+    }, na_rep="—"),
     use_container_width=True, height=420
 )
 
