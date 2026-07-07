@@ -78,11 +78,11 @@ f["TruckCaseCapacity"] = f["RecommendedTruckTonnage"].apply(
     lambda t: round(cases_per_truck(t, edited_veh_block))
 )
 f["TrucksPerDay"] = np.ceil(f["DailyAvgLoad"] / f["TruckCaseCapacity"]).replace([np.inf, -np.inf], np.nan)
-f["TrucksPerMonth (truck-trips)"] = f["TrucksPerDay"] * working_days
+f["VehiclesPerMonth"] = f["TrucksPerDay"] * working_days
 f["MTD Target (cumulative)"] = f["MonthlyTarget"]  # full month reference for MTD tracking table below
 
 # whole numbers only — no fractional cases or trucks
-for c in ["MonthlyTarget", "DailyAvgLoad", "TruckCaseCapacity", "TrucksPerDay", "TrucksPerMonth (truck-trips)"]:
+for c in ["MonthlyTarget", "DailyAvgLoad", "TruckCaseCapacity", "TrucksPerDay", "VehiclesPerMonth"]:
     f[c] = f[c].fillna(0).round(0).astype(int)
 
 # ---------------- KPI CARDS ----------------
@@ -129,13 +129,13 @@ st.subheader("📋 Distributor-wise Daily Load & Truck Requirement")
 display_cols = [
     "DBR CODE", "Distributor", "Town", "District", "MaxVehicleTonnage",
     "MonthlyTarget", "DailyAvgLoad", "RecommendedTruckTonnage", "TruckCaseCapacity",
-    "TrucksPerDay", "TrucksPerMonth (truck-trips)"
+    "TrucksPerDay", "VehiclesPerMonth"
 ]
 st.dataframe(
     f[display_cols].sort_values("DailyAvgLoad", ascending=False).style.format({
         "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "DailyAvgLoad": "{:,.0f}",
         "RecommendedTruckTonnage": "{:,.0f}", "TruckCaseCapacity": "{:,.0f}",
-        "TrucksPerDay": "{:,.0f}", "TrucksPerMonth (truck-trips)": "{:,.0f}"
+        "TrucksPerDay": "{:,.0f}", "VehiclesPerMonth": "{:,.0f}"
     }, na_rep="—"),
     use_container_width=True, height=420
 )
@@ -148,7 +148,7 @@ with st.expander("ℹ️ Methodology"):
     3. **Truck Case Capacity** = interpolated from the Truck size ↔ Case capacity table in the sidebar
        (edit it if your real per-truck case capacities differ).
     4. **Trucks/Day** = ROUNDUP( Daily Avg Load ÷ Truck Case Capacity )
-    5. **Trucks/Month** = Trucks/Day × Working Days (total truck-trips needed across the month)
+    5. **Trucks/Month** = Trucks/Day × Working Days (total vehicle dispatches needed across the month)
 
     This page assumes **flat daily dispatch** — no delivery-frequency logic. Use the
     *Frequency Based* calculator if deliveries don't happen every working day.
@@ -188,14 +188,14 @@ with st.container(border=True):
     st.subheader(f"📊 {sel_month.title()} — Monthly Fleet Requirement Summary")
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Monthly Volume (cases)", f"{m_vol:,}")
-    s2.metric("Total Truck-Trips", f"{m_total_trucks:,}")
+    s2.metric("Total Vehicles Needed", f"{m_total_trucks:,}")
     s3.metric("🟦 Own Fleet", f"{m_own:,}")
     s4.metric("🟧 Fixed/Bachat", f"{m_fixed:,}")
     s5.metric("🟥 Spot Hire", f"{m_spot:,}")
 
     st.write(
         f"To move **{m_vol:,} cases** in {sel_month.title()} ({int(working_days)} working days), you need "
-        f"**{m_total_trucks:,} truck-trips** total: **{m_own:,} from Own fleet**, "
+        f"**{m_total_trucks:,} vehicles** total: **{m_own:,} from Own fleet**, "
         f"**{m_fixed:,} from Fixed/Bachat**, and **{m_spot:,} from Spot Hire** "
         f"(arranged from the market, same day)."
     )
@@ -240,7 +240,7 @@ with st.expander("🛠️ Advanced — customize day-by-day requirement (if dail
     total_spot_used_a = int(alloc_df["Spot Hire Used"].sum())
 
     a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Total Truck-Trips Needed", f"{total_need_a:,}")
+    a1.metric("Total Vehicles Needed", f"{total_need_a:,}")
     a2.metric("Own Fleet Used", f"{total_own_used_a:,}")
     a3.metric("Fixed/Bachat Used", f"{total_fixed_used_a:,}")
     a4.metric("Spot Hire Needed", f"{total_spot_used_a:,}")

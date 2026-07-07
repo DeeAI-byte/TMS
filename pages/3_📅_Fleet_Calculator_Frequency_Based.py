@@ -19,7 +19,7 @@ st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem
 st.caption("🥤 Coca-Cola - SLMG")
 st.title("📅 Monthly Fleet Calculator — Frequency Based")
 st.caption("Delivery frequency is derived from each distributor's monthly volume bracket "
-           "(per your Assumptions sheet), then truck-trips are computed per delivery cycle.")
+           "(per your Assumptions sheet), then vehicles needed are computed per delivery cycle.")
 st.write("---")
 
 try:
@@ -121,22 +121,22 @@ f["TruckCaseCapacity"] = f["RecommendedTruckTonnage"].apply(
     lambda t: round(cases_per_truck(t, edited_veh_block))
 )
 f["TrucksPerTrip"] = np.ceil(f["LoadPerTrip"] / f["TruckCaseCapacity"]).replace([np.inf, -np.inf], np.nan)
-f["TotalTruckTripsPerMonth"] = f["TrucksPerTrip"] * f["TripsPerMonth"]
+f["TotalVehiclesPerMonth"] = f["TrucksPerTrip"] * f["TripsPerMonth"]
 
 # whole numbers only — no fractional cases, trips, or trucks
-for c in ["MonthlyTarget", "TripsPerMonth", "LoadPerTrip", "TruckCaseCapacity", "TrucksPerTrip", "TotalTruckTripsPerMonth"]:
+for c in ["MonthlyTarget", "TripsPerMonth", "LoadPerTrip", "TruckCaseCapacity", "TrucksPerTrip", "TotalVehiclesPerMonth"]:
     f[c] = f[c].fillna(0).round(0).astype(int)
 
 # ---------------- KPI CARDS ----------------
 total_monthly_target = f["MonthlyTarget"].sum()
 total_trips_per_month = f["TripsPerMonth"].sum()
-total_truck_trips = f["TotalTruckTripsPerMonth"].sum()
+total_truck_trips = f["TotalVehiclesPerMonth"].sum()
 avg_load_per_trip = f["LoadPerTrip"].mean()
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric(f"{sel_month.title()} Target (cases)", f"{int(total_monthly_target):,}")
 k2.metric("Total Delivery Trips / Month", f"{int(total_trips_per_month):,}")
-k3.metric("Total Truck-Trips Needed / Month", f"{int(total_truck_trips):,}")
+k3.metric("Total Vehicles Needed / Month", f"{int(total_truck_trips):,}")
 k4.metric("Avg Load / Trip (cases)", f"{int(round(avg_load_per_trip)):,}" if pd.notna(avg_load_per_trip) else "—")
 
 st.write("")
@@ -152,11 +152,11 @@ with c1:
         st.plotly_chart(fig, use_container_width=True)
 
 with c2:
-    st.subheader("🚚 Truck-Trips / Month by District")
-    chart_df = f.groupby("District", as_index=False)["TotalTruckTripsPerMonth"].sum().sort_values(
-        "TotalTruckTripsPerMonth", ascending=False)
+    st.subheader("🚚 Vehicles Needed / Month by District")
+    chart_df = f.groupby("District", as_index=False)["TotalVehiclesPerMonth"].sum().sort_values(
+        "TotalVehiclesPerMonth", ascending=False)
     if not chart_df.empty:
-        fig2 = px.bar(chart_df, x="District", y="TotalTruckTripsPerMonth", color="TotalTruckTripsPerMonth",
+        fig2 = px.bar(chart_df, x="District", y="TotalVehiclesPerMonth", color="TotalVehiclesPerMonth",
                       color_continuous_scale="Purples")
         fig2.update_layout(showlegend=False, height=380, margin=dict(t=10))
         st.plotly_chart(fig2, use_container_width=True)
@@ -173,13 +173,13 @@ st.subheader("📋 Distributor-wise Frequency & Truck Requirement")
 display_cols = [
     "DBR CODE", "Distributor", "Town", "District", "MaxVehicleTonnage", "MonthlyTarget",
     "Frequency", "TripsPerMonth", "LoadPerTrip", "RecommendedTruckTonnage",
-    "TruckCaseCapacity", "TrucksPerTrip", "TotalTruckTripsPerMonth"
+    "TruckCaseCapacity", "TrucksPerTrip", "TotalVehiclesPerMonth"
 ]
 st.dataframe(
     f[display_cols].sort_values("MonthlyTarget", ascending=False).style.format({
         "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "TripsPerMonth": "{:,.0f}",
         "LoadPerTrip": "{:,.0f}", "RecommendedTruckTonnage": "{:,.0f}",
-        "TruckCaseCapacity": "{:,.0f}", "TrucksPerTrip": "{:,.0f}", "TotalTruckTripsPerMonth": "{:,.0f}"
+        "TruckCaseCapacity": "{:,.0f}", "TrucksPerTrip": "{:,.0f}", "TotalVehiclesPerMonth": "{:,.0f}"
     }, na_rep="—"),
     use_container_width=True, height=420
 )
@@ -192,7 +192,7 @@ with st.expander("ℹ️ Methodology"):
     3. **Load/Trip** = Monthly Target ÷ Trips/Month.
     4. **Recommended Truck** = largest truck ≤ the distributor's Max Capacity Vehicle limit.
     5. **Trucks/Trip** = ROUNDUP( Load/Trip ÷ Truck Case Capacity ).
-    6. **Total Truck-Trips/Month** = Trucks/Trip × Trips/Month.
+    6. **Total Vehicles Needed/Month** = Trucks/Trip × Trips/Month.
 
     Adjust *Working days/week*, *Weeks in month*, the frequency brackets, or the truck
     case-capacity table in the sidebar to match your actual operating calendar.
@@ -216,7 +216,7 @@ st.caption("Priority every working day: **Own fleet first → Fixed/Bachat next 
 working_days_in_month = int(round(working_days_per_week * weeks_in_month))
 avg_truck_trips_per_day = int(np.ceil(total_truck_trips / working_days_in_month)) if working_days_in_month > 0 else 0
 
-# --- Default (standard) simulation: total monthly truck-trips spread evenly across working days ---
+# --- Default (standard) simulation: total monthly vehicle requirement spread evenly across working days ---
 default_daily_requirements_f = [avg_truck_trips_per_day] * working_days_in_month
 default_alloc_rows_f = simulate_daily_allocation(default_daily_requirements_f, int(own_total), int(fixed_total),
                                                   return_rate=return_rate_pct / 100.0, tat_days=int(tat_days))
@@ -235,14 +235,14 @@ with st.container(border=True):
     st.subheader(f"📊 {sel_month.title()} — Monthly Fleet Requirement Summary")
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Monthly Volume (cases)", f"{m_vol_f:,}")
-    s2.metric("Total Truck-Trips", f"{m_total_trucks_f:,}")
+    s2.metric("Total Vehicles Needed", f"{m_total_trucks_f:,}")
     s3.metric("🟦 Own Fleet", f"{m_own_f:,}")
     s4.metric("🟧 Fixed/Bachat", f"{m_fixed_f:,}")
     s5.metric("🟥 Spot Hire", f"{m_spot_f:,}")
 
     st.write(
         f"To move **{m_vol_f:,} cases** in {sel_month.title()} (~{working_days_in_month} working days at your "
-        f"current frequency mix), you need **{m_total_trucks_f:,} truck-trips** total: "
+        f"current frequency mix), you need **{m_total_trucks_f:,} vehicles** total: "
         f"**{m_own_f:,} from Own fleet**, **{m_fixed_f:,} from Fixed/Bachat**, and "
         f"**{m_spot_f:,} from Spot Hire** (arranged from the market, same day)."
     )
@@ -252,12 +252,12 @@ with st.container(border=True):
     else:
         st.success("✅ Own + Fixed fleet fully covers this month's demand — no spot hire needed.")
 
-st.caption("ℹ️ This assumes total monthly truck-trips are spread evenly across working days — real "
+st.caption("ℹ️ This assumes total monthly vehicle requirement are spread evenly across working days — real "
            "delivery days differ by distributor frequency. Use 'Advanced' below for a day-by-day custom pattern.")
 
 # --- Advanced: let the user customize day-by-day if the pattern isn't flat ---
 with st.expander("🛠️ Advanced — customize day-by-day requirement (if actual delivery days vary)"):
-    st.caption(f"Defaults to spreading the **{total_truck_trips:,} total truck-trips/month** evenly across "
+    st.caption(f"Defaults to spreading the **{total_truck_trips:,} total vehicles needed/month** evenly across "
                f"**{working_days_in_month} working days** (≈{avg_truck_trips_per_day:,}/day). Edit any day "
                "to reflect real variation — the chart & table below will update.")
 
@@ -291,7 +291,7 @@ with st.expander("🛠️ Advanced — customize day-by-day requirement (if actu
     total_spot_used_f = int(alloc_df_f["Spot Hire Used"].sum())
 
     b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Total Truck-Trips Needed", f"{total_need_f:,}")
+    b1.metric("Total Vehicles Needed", f"{total_need_f:,}")
     b2.metric("Own Fleet Used", f"{total_own_used_f:,}")
     b3.metric("Fixed/Bachat Used", f"{total_fixed_used_f:,}")
     b4.metric("Spot Hire Needed", f"{total_spot_used_f:,}")
