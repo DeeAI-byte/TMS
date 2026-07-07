@@ -226,29 +226,35 @@ for c in default_alloc_df_f.columns:
         default_alloc_df_f[c] = default_alloc_df_f[c].round(0).astype(int)
 
 m_vol_f = int(total_monthly_target)
-m_own_f = int(default_alloc_df_f["Own Used"].sum())
-m_fixed_f = int(default_alloc_df_f["Fixed Used"].sum())
-m_spot_f = int(default_alloc_df_f["Spot Hire Used"].sum())
-m_total_trucks_f = m_own_f + m_fixed_f + m_spot_f
+avg_own_per_day_f = int(round(default_alloc_df_f["Own Used"].mean()))
+avg_fixed_per_day_f = int(round(default_alloc_df_f["Fixed Used"].mean()))
+avg_spot_per_day_f = int(round(default_alloc_df_f["Spot Hire Used"].mean()))
+avg_total_per_day_f = avg_own_per_day_f + avg_fixed_per_day_f + avg_spot_per_day_f
+total_spot_month_f = int(default_alloc_df_f["Spot Hire Used"].sum())
+spot_days_f = int((default_alloc_df_f["Spot Hire Used"] > 0).sum())
+max_spot_single_day_f = int(default_alloc_df_f["Spot Hire Used"].max())
 
 with st.container(border=True):
-    st.subheader(f"📊 {sel_month.title()} — Monthly Fleet Requirement Summary")
+    st.subheader(f"📊 {sel_month.title()} — Daily Fleet Requirement (what to tell transporters)")
+    st.caption("Own & Fixed/Bachat trucks are reused every day, so these are **per-day vehicle counts** — "
+               "not summed across the month.")
     s1, s2, s3, s4, s5 = st.columns(5)
     s1.metric("Monthly Volume (cases)", f"{m_vol_f:,}")
-    s2.metric("Total Vehicles Needed", f"{m_total_trucks_f:,}")
-    s3.metric("🟦 Own Fleet", f"{m_own_f:,}")
-    s4.metric("🟧 Fixed/Bachat", f"{m_fixed_f:,}")
-    s5.metric("🟥 Spot Hire", f"{m_spot_f:,}")
+    s2.metric("Vehicles Needed / Day", f"{avg_total_per_day_f:,}")
+    s3.metric("🟦 Own Fleet / Day", f"{avg_own_per_day_f:,}")
+    s4.metric("🟧 Fixed/Bachat / Day", f"{avg_fixed_per_day_f:,}")
+    s5.metric("🟥 Spot Hire / Day", f"{avg_spot_per_day_f:,}")
 
     st.write(
-        f"To move **{m_vol_f:,} cases** in {sel_month.title()} (~{working_days_in_month} working days at your "
-        f"current frequency mix), you need **{m_total_trucks_f:,} vehicles** total: "
-        f"**{m_own_f:,} from Own fleet**, **{m_fixed_f:,} from Fixed/Bachat**, and "
-        f"**{m_spot_f:,} from Spot Hire** (arranged from the market, same day)."
+        f"On a typical working day in {sel_month.title()} (~{working_days_in_month} working days at your "
+        f"current frequency mix), you need **{avg_total_per_day_f:,} vehicles**: "
+        f"**{avg_own_per_day_f:,} from your Own fleet**, **{avg_fixed_per_day_f:,} from Fixed/Bachat**, and "
+        f"**{avg_spot_per_day_f:,} from Spot Hire** (arranged fresh from the market that day)."
     )
-    if m_spot_f > 0:
-        spot_days_f = int((default_alloc_df_f["Spot Hire Used"] > 0).sum())
-        st.warning(f"⚠️ Spot hire needed on {spot_days_f} of {working_days_in_month} working days this month.")
+    if total_spot_month_f > 0:
+        st.warning(f"⚠️ Spot hire needed on **{spot_days_f} of {working_days_in_month}** working days this month "
+                   f"— up to **{max_spot_single_day_f} vehicles** on the busiest day, "
+                   f"**~{total_spot_month_f:,} total market bookings** across the month.")
     else:
         st.success("✅ Own + Fixed fleet fully covers this month's demand — no spot hire needed.")
 
