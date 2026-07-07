@@ -16,6 +16,7 @@ from utils.data_loader import (
 st.set_page_config(page_title="Fleet Calculator | Frequency Based", page_icon="📅", layout="wide")
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
+st.caption("🥤 Coca-Cola - SLMG")
 st.title("📅 Monthly Fleet Calculator — Frequency Based")
 st.caption("Delivery frequency is derived from each distributor's monthly volume bracket "
            "(per your Assumptions sheet), then truck-trips are computed per delivery cycle.")
@@ -208,65 +209,108 @@ st.download_button(
 # FLEET ALLOCATION SIMULATION — Own → Fixed/Bachat → Spot Hire, with TAT-based returns
 # =====================================================================================
 st.write("---")
-st.header("🔄 Fleet Allocation — Priority + Turn-Around-Time (TAT)")
+st.header(f"🔄 Fleet Allocation — {sel_month.title()} — Priority + Turn-Around-Time (TAT)")
+st.caption("Priority every working day: **Own fleet first → Fixed/Bachat next → Spot Hire (market)** "
+           "covers any shortfall, accounting for trucks still in transit and expected returns.")
 
 working_days_in_month = int(round(working_days_per_week * weeks_in_month))
 avg_truck_trips_per_day = int(np.ceil(total_truck_trips / working_days_in_month)) if working_days_in_month > 0 else 0
 
-st.caption(f"Delivery days aren't identical across distributors under a frequency model, so this spreads the "
-           f"**{total_truck_trips:,} total truck-trips/month** evenly across **{working_days_in_month} working "
-           f"days** (≈{avg_truck_trips_per_day:,}/day) as a starting point — edit any day below for a more "
-           f"realistic pattern. Priority: **Own fleet → Fixed/Bachat → Spot Hire (market)**, with TAT-based returns.")
-
-if working_days_in_month != int(st.session_state.get("_wd_cached_freq", -1)):
-    st.session_state.freq_alloc_df = pd.DataFrame({
-        "Day": list(range(1, working_days_in_month + 1)),
-        "Trucks Required": [avg_truck_trips_per_day] * working_days_in_month
-    })
-    st.session_state._wd_cached_freq = working_days_in_month
-
-edited_freq_alloc_df = st.data_editor(
-    st.session_state.freq_alloc_df, num_rows="fixed", use_container_width=True,
-    key="freq_alloc_editor", hide_index=True,
-    column_config={
-        "Day": st.column_config.NumberColumn(disabled=True),
-        "Trucks Required": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
-    }
-)
-daily_requirements_f = [int(round(x)) for x in edited_freq_alloc_df["Trucks Required"].tolist()]
-
-alloc_rows_f = simulate_daily_allocation(daily_requirements_f, int(own_total), int(fixed_total),
-                                          return_rate=return_rate_pct / 100.0, tat_days=int(tat_days))
-alloc_df_f = pd.DataFrame(alloc_rows_f)
-for c in alloc_df_f.columns:
+# --- Default (standard) simulation: total monthly truck-trips spread evenly across working days ---
+default_daily_requirements_f = [avg_truck_trips_per_day] * working_days_in_month
+default_alloc_rows_f = simulate_daily_allocation(default_daily_requirements_f, int(own_total), int(fixed_total),
+                                                  return_rate=return_rate_pct / 100.0, tat_days=int(tat_days))
+default_alloc_df_f = pd.DataFrame(default_alloc_rows_f)
+for c in default_alloc_df_f.columns:
     if c != "Day":
-        alloc_df_f[c] = alloc_df_f[c].round(0).astype(int)
+        default_alloc_df_f[c] = default_alloc_df_f[c].round(0).astype(int)
 
-total_need_f = int(alloc_df_f["Trucks Required"].sum())
-total_own_used_f = int(alloc_df_f["Own Used"].sum())
-total_fixed_used_f = int(alloc_df_f["Fixed Used"].sum())
-total_spot_used_f = int(alloc_df_f["Spot Hire Used"].sum())
+m_vol_f = int(total_monthly_target)
+m_own_f = int(default_alloc_df_f["Own Used"].sum())
+m_fixed_f = int(default_alloc_df_f["Fixed Used"].sum())
+m_spot_f = int(default_alloc_df_f["Spot Hire Used"].sum())
+m_total_trucks_f = m_own_f + m_fixed_f + m_spot_f
 
-b1, b2, b3, b4 = st.columns(4)
-b1.metric("Total Truck-Trips Needed", f"{total_need_f:,}")
-b2.metric("Own Fleet Used", f"{total_own_used_f:,}")
-b3.metric("Fixed/Bachat Used", f"{total_fixed_used_f:,}")
-b4.metric("Spot Hire Needed", f"{total_spot_used_f:,}")
+with st.container(border=True):
+    st.subheader(f"📊 {sel_month.title()} — Monthly Fleet Requirement Summary")
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Monthly Volume (cases)", f"{m_vol_f:,}")
+    s2.metric("Total Truck-Trips", f"{m_total_trucks_f:,}")
+    s3.metric("🟦 Own Fleet", f"{m_own_f:,}")
+    s4.metric("🟧 Fixed/Bachat", f"{m_fixed_f:,}")
+    s5.metric("🟥 Spot Hire", f"{m_spot_f:,}")
 
-if total_spot_used_f > 0:
-    st.warning(f"⚠️ Spot hire required on {int((alloc_df_f['Spot Hire Used'] > 0).sum())} of "
-               f"{working_days_in_month} working days — {total_spot_used_f:,} truck-trips to arrange from the market.")
-else:
-    st.success("✅ Own + Fixed fleet fully covers demand across all working days — no spot hire needed.")
+    st.write(
+        f"To move **{m_vol_f:,} cases** in {sel_month.title()} (~{working_days_in_month} working days at your "
+        f"current frequency mix), you need **{m_total_trucks_f:,} truck-trips** total: "
+        f"**{m_own_f:,} from Own fleet**, **{m_fixed_f:,} from Fixed/Bachat**, and "
+        f"**{m_spot_f:,} from Spot Hire** (arranged from the market, same day)."
+    )
+    if m_spot_f > 0:
+        spot_days_f = int((default_alloc_df_f["Spot Hire Used"] > 0).sum())
+        st.warning(f"⚠️ Spot hire needed on {spot_days_f} of {working_days_in_month} working days this month.")
+    else:
+        st.success("✅ Own + Fixed fleet fully covers this month's demand — no spot hire needed.")
 
-chart_alloc_f = alloc_df_f.melt(id_vars=["Day"], value_vars=["Own Used", "Fixed Used", "Spot Hire Used"],
-                                 var_name="Source", value_name="Trucks")
-fig_alloc_f = px.bar(chart_alloc_f, x="Day", y="Trucks", color="Source", barmode="stack",
-                      color_discrete_map={"Own Used": "#1b4fd2", "Fixed Used": "#f2a20c", "Spot Hire Used": "#d93838"})
-fig_alloc_f.update_layout(height=380, margin=dict(t=10))
-st.plotly_chart(fig_alloc_f, use_container_width=True)
+st.caption("ℹ️ This assumes total monthly truck-trips are spread evenly across working days — real "
+           "delivery days differ by distributor frequency. Use 'Advanced' below for a day-by-day custom pattern.")
 
-st.dataframe(alloc_df_f, use_container_width=True, height=380)
+# --- Advanced: let the user customize day-by-day if the pattern isn't flat ---
+with st.expander("🛠️ Advanced — customize day-by-day requirement (if actual delivery days vary)"):
+    st.caption(f"Defaults to spreading the **{total_truck_trips:,} total truck-trips/month** evenly across "
+               f"**{working_days_in_month} working days** (≈{avg_truck_trips_per_day:,}/day). Edit any day "
+               "to reflect real variation — the chart & table below will update.")
+
+    if working_days_in_month != int(st.session_state.get("_wd_cached_freq", -1)):
+        st.session_state.freq_alloc_df = pd.DataFrame({
+            "Day": list(range(1, working_days_in_month + 1)),
+            "Trucks Required": default_daily_requirements_f
+        })
+        st.session_state._wd_cached_freq = working_days_in_month
+
+    edited_freq_alloc_df = st.data_editor(
+        st.session_state.freq_alloc_df, num_rows="fixed", use_container_width=True,
+        key="freq_alloc_editor", hide_index=True,
+        column_config={
+            "Day": st.column_config.NumberColumn(disabled=True),
+            "Trucks Required": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+        }
+    )
+    daily_requirements_f = [int(round(x)) for x in edited_freq_alloc_df["Trucks Required"].tolist()]
+
+    alloc_rows_f = simulate_daily_allocation(daily_requirements_f, int(own_total), int(fixed_total),
+                                              return_rate=return_rate_pct / 100.0, tat_days=int(tat_days))
+    alloc_df_f = pd.DataFrame(alloc_rows_f)
+    for c in alloc_df_f.columns:
+        if c != "Day":
+            alloc_df_f[c] = alloc_df_f[c].round(0).astype(int)
+
+    total_need_f = int(alloc_df_f["Trucks Required"].sum())
+    total_own_used_f = int(alloc_df_f["Own Used"].sum())
+    total_fixed_used_f = int(alloc_df_f["Fixed Used"].sum())
+    total_spot_used_f = int(alloc_df_f["Spot Hire Used"].sum())
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Total Truck-Trips Needed", f"{total_need_f:,}")
+    b2.metric("Own Fleet Used", f"{total_own_used_f:,}")
+    b3.metric("Fixed/Bachat Used", f"{total_fixed_used_f:,}")
+    b4.metric("Spot Hire Needed", f"{total_spot_used_f:,}")
+
+    chart_alloc_f = alloc_df_f.melt(id_vars=["Day"], value_vars=["Own Used", "Fixed Used", "Spot Hire Used"],
+                                     var_name="Source", value_name="Trucks")
+    fig_alloc_f = px.bar(chart_alloc_f, x="Day", y="Trucks", color="Source", barmode="stack",
+                          color_discrete_map={"Own Used": "#1b4fd2", "Fixed Used": "#f2a20c", "Spot Hire Used": "#d93838"})
+    fig_alloc_f.update_layout(height=380, margin=dict(t=10))
+    st.plotly_chart(fig_alloc_f, use_container_width=True)
+
+    st.dataframe(alloc_df_f, use_container_width=True, height=380)
+
+    st.download_button(
+        "⬇️ Download customized allocation table as CSV",
+        alloc_df_f.to_csv(index=False).encode("utf-8"),
+        file_name=f"fleet_allocation_frequency_{sel_month.lower()}.csv",
+        mime="text/csv"
+    )
 
 with st.expander("ℹ️ Allocation Methodology"):
     st.markdown(f"""

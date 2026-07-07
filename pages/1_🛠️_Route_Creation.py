@@ -14,6 +14,7 @@ st.set_page_config(page_title="Interactive Logistics Router", page_icon="🛠️
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
 # Streamlit Native Header
+st.caption("🥤 Coca-Cola - SLMG")
 st.title("🛠️ Route Creation")
 st.write("---")
 
@@ -142,7 +143,6 @@ else:
         if st.session_state.sel_wh == "None":
             st.info("💡 Please select a Warehouse/Plant to start routing configuration.")
         elif len(active_dbrs) > 0:
-            st.success("✅ Route Ready Hai!")
             st.metric(label="Total Distance", value=f"{round(min_road_distance, 2)} KM")
 
             st.write("**Route Sequence:**")
