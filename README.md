@@ -1,6 +1,6 @@
 # 🚛 Logistics TMS — Multi-Page Streamlit App
 
-A 4-dashboard Transport Management System built on top of your existing Route
+A 5-dashboard Transport Management System built on top of your existing Route
 Creation app, using your real data:
 - `locations.xlsx` — Warehouse/Plant/DBR (town) coordinates
 - `Distributor_wise_Max_Vehicle_Capacity.xlsx` — distributor max-vehicle limits,
@@ -12,8 +12,9 @@ Creation app, using your real data:
 |---|------|---------|
 | 1 | **Overview** (app.py) | KPI cards, charts, district/town/transporter slicers, distributor search |
 | 2 | **Route Creation** | Your existing live app — warehouse → DBR route optimizer on the map |
-| 3 | **Fleet Calculator – Daily Load** | Trucks needed per day/month (no frequency), **plus** a Priority + TAT allocation section: Own fleet → Fixed/Bachat → Spot Hire, factoring in trucks still in transit and expected returns |
-| 4 | **Fleet Calculator – Frequency Based** | Trucks needed using the MTD-volume → delivery-frequency brackets from your Assumptions sheet, **plus** the same Priority + TAT allocation section |
+| 3 | **Fleet Calculator – Daily Load** | Trucks needed per day/month (no frequency), plus Priority + TAT allocation |
+| 4 | **Fleet Calculator – Frequency Based** | Trucks needed via volume→frequency brackets, with real day-of-week distributor scheduling (not flat averaging) and the same Priority + TAT allocation |
+| 5 | **Live Fleet Tracker** | Reads a live Google Sheet gate-out log to show real available Own/Fixed fleet right now, for same-day spot hire decisions |
 
 ## Project structure
 
@@ -23,7 +24,8 @@ tms/
 ├── pages/
 │   ├── 1_🛠️_Route_Creation.py
 │   ├── 2_📦_Fleet_Calculator_Daily_Load.py
-│   └── 3_📅_Fleet_Calculator_Frequency_Based.py
+│   ├── 3_📅_Fleet_Calculator_Frequency_Based.py
+│   └── 4_📡_Live_Fleet_Tracker.py
 ├── utils/
 │   └── data_loader.py                        # shared data loading/cleaning — single source of truth
 ├── data/

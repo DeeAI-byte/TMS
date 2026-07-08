@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_loader import (
     build_master_table, load_assumptions, load_vehicle_database,
     cases_per_truck, best_truck_for_tonnage_limit, get_month_options,
-    fleet_totals_by_ownership, simulate_daily_allocation
+    fleet_totals_by_ownership, simulate_daily_allocation, compute_frequency_daily_schedule
 )
 
 st.set_page_config(page_title="Fleet Calculator | Frequency Based", page_icon="📅", layout="wide")
@@ -186,6 +186,20 @@ st.dataframe(
     use_container_width=True, height=420
 )
 
+with st.expander("🔍 Diagnostic — why is the truck requirement high for some distributors?"):
+    st.caption("If a distributor's frequency bucket gives them few trips/month but they have high volume, "
+               "their per-trip load can require MULTIPLE trucks in a single visit. This is a calibration "
+               "question: either your real trucks carry more cases than the assumed capacity below, or "
+               "high-volume distributors need a higher frequency than their volume bracket currently assigns.")
+    trip_dist = f["TrucksPerTrip"].value_counts().sort_index().reset_index()
+    trip_dist.columns = ["Trucks Needed / Single Visit", "Number of Distributors"]
+    st.dataframe(trip_dist, use_container_width=True, hide_index=True)
+    multi_truck_count = int((f["TrucksPerTrip"] > 1).sum())
+    if multi_truck_count > 0:
+        st.warning(f"⚠️ **{multi_truck_count} of {len(f)} distributors** need more than 1 truck for a single "
+                   f"visit this month. Raise the Truck size ↔ Case capacity table in the sidebar if your real "
+                   f"trucks carry more cases per load, or increase frequency for high-volume distributors.")
+
 with st.expander("ℹ️ Methodology"):
     st.markdown(f"""
     1. **Frequency** is looked up from the MTD-volume bracket (Assumptions sheet) each
@@ -216,10 +230,12 @@ st.caption("Priority every working day: **Own fleet first → Fixed/Bachat next 
            "covers any shortfall, accounting for trucks still in transit and expected returns.")
 
 working_days_in_month = int(round(working_days_per_week * weeks_in_month))
-avg_truck_trips_per_day = int(np.ceil(total_truck_trips / working_days_in_month)) if working_days_in_month > 0 else 0
 
-# --- Default (standard) simulation: total monthly vehicle requirement spread evenly across working days ---
-default_daily_requirements_f = [avg_truck_trips_per_day] * working_days_in_month
+# --- Real schedule: each distributor only needs a truck on ITS actual visit days ---
+default_daily_requirements_f = compute_frequency_daily_schedule(f, working_days_per_week, weeks_in_month)
+if len(default_daily_requirements_f) == 0:
+    default_daily_requirements_f = [0] * working_days_in_month
+
 default_alloc_rows_f = simulate_daily_allocation(default_daily_requirements_f, int(own_total), int(fixed_total),
                                                   return_rate=return_rate_pct / 100.0, tat_days=int(tat_days))
 default_alloc_df_f = pd.DataFrame(default_alloc_rows_f)
@@ -234,7 +250,9 @@ avg_spot_per_day_f = int(round(default_alloc_df_f["Spot Hire Used"].mean()))
 avg_total_per_day_f = avg_own_per_day_f + avg_fixed_per_day_f + avg_spot_per_day_f
 total_spot_month_f = int(default_alloc_df_f["Spot Hire Used"].sum())
 spot_days_f = int((default_alloc_df_f["Spot Hire Used"] > 0).sum())
-max_spot_single_day_f = int(default_alloc_df_f["Spot Hire Used"].max())
+max_spot_single_day_f = int(default_alloc_df_f["Spot Hire Used"].max()) if len(default_alloc_df_f) else 0
+min_need_day_f = int(default_alloc_df_f["Trucks Required"].min()) if len(default_alloc_df_f) else 0
+max_need_day_f = int(default_alloc_df_f["Trucks Required"].max()) if len(default_alloc_df_f) else 0
 
 with st.container(border=True):
     s1, s2, s3, s4 = st.columns(4)
@@ -244,26 +262,28 @@ with st.container(border=True):
     s4.metric("🟥 Spot Hire Needed This Month", f"{total_spot_month_f:,}")
 
     st.write(
-        f"Your **Own ({int(own_total):,})** and **Fixed/Bachat ({int(fixed_total):,})** fleets are reused "
-        f"daily and cover most of {sel_month.title()}'s demand (~{avg_own_per_day_f:,} Own + "
-        f"{avg_fixed_per_day_f:,} Fixed/Bachat vehicles on a typical day). To fully cover the month, you'll "
-        f"need to arrange **~{total_spot_month_f:,} Spot Hire vehicle bookings** from the market — "
-        f"needed on **{spot_days_f} of {working_days_in_month}** working days, up to "
-        f"**{max_spot_single_day_f} vehicles** on the busiest day."
+        f"Distributors are now scheduled on their **actual visit days** (Twice/Week, Thrice/Week, or Daily) "
+        f"instead of assuming everyone needs a truck every day — so daily need genuinely swings between "
+        f"**{min_need_day_f} and {max_need_day_f} trucks/day** across {sel_month.title()}. Your "
+        f"**Own ({int(own_total):,})** and **Fixed/Bachat ({int(fixed_total):,})** fleets, reused daily, "
+        f"cover an average of **~{avg_own_per_day_f:,} Own + {avg_fixed_per_day_f:,} Fixed/Bachat** vehicles "
+        f"a day. To fully cover the month, you'll need to arrange **~{total_spot_month_f:,} Spot Hire vehicle "
+        f"bookings** from the market — needed on **{spot_days_f} of {working_days_in_month}** working days, "
+        f"up to **{max_spot_single_day_f} vehicles** on the busiest day."
     )
     if total_spot_month_f == 0:
         st.success("✅ Own + Fixed fleet fully covers this month's demand — no spot hire needed.")
 
-st.caption("ℹ️ This assumes total monthly vehicle requirement are spread evenly across working days — real "
-           "delivery days differ by distributor frequency. Use 'Advanced' below for a day-by-day custom pattern.")
+st.caption("ℹ️ Each distributor is scheduled on evenly-spaced visit days based on its frequency bucket "
+           "(e.g. Twice/Week distributors get 2 of your working days per week, not all of them). "
+           "Use 'Advanced' below to fine-tune the day-by-day pattern manually.")
 
-# --- Advanced: let the user customize day-by-day if the pattern isn't flat ---
+# --- Advanced: let the user customize day-by-day if the real pattern differs ---
 with st.expander("🛠️ Advanced — customize day-by-day requirement (if actual delivery days vary)"):
-    st.caption(f"Defaults to spreading the **{total_truck_trips:,} total vehicles needed/month** evenly across "
-               f"**{working_days_in_month} working days** (≈{avg_truck_trips_per_day:,}/day). Edit any day "
-               "to reflect real variation — the chart & table below will update.")
+    st.caption("Defaults to the schedule computed above (each distributor only on its visit days). "
+               "Edit any day to reflect real variation — the chart & table below will update.")
 
-    _cache_key_freq = (sel_month, working_days_in_month, avg_truck_trips_per_day)
+    _cache_key_freq = (sel_month, working_days_in_month, tuple(default_daily_requirements_f))
     if st.session_state.get("_cache_key_freq") != _cache_key_freq:
         st.session_state.freq_alloc_df = pd.DataFrame({
             "Day": list(range(1, working_days_in_month + 1)),
@@ -316,6 +336,12 @@ with st.expander("🛠️ Advanced — customize day-by-day requirement (if actu
 
 with st.expander("ℹ️ Allocation Methodology"):
     st.markdown(f"""
+    **Scheduling:** each distributor is assigned evenly-spaced day-of-week visit slots based on its
+    frequency bucket (e.g. a Twice/Week distributor is only scheduled on 2 of your
+    {int(working_days_per_week)} working days each week). A day's total requirement is the sum of
+    Trucks/Trip across only the distributors scheduled that day — so lower-frequency distributors
+    genuinely reduce daily truck need on their off-days, instead of being smoothed into a flat average.
+
     **Priority every day:** Own fleet → Fixed/Bachat fleet → Spot Hire (uncapped, market-arranged same-day).
 
     **Returns logic:** a truck dispatched today is unavailable today. **{return_rate_pct}%** of that day's
@@ -325,10 +351,3 @@ with st.expander("ℹ️ Allocation Methodology"):
 
     All figures are whole truck counts.
     """)
-
-st.download_button(
-    "⬇️ Download allocation table as CSV",
-    alloc_df_f.to_csv(index=False).encode("utf-8"),
-    file_name=f"fleet_allocation_frequency_{sel_month.lower()}.csv",
-    mime="text/csv"
-)

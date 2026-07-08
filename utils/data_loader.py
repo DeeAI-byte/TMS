@@ -158,6 +158,86 @@ def get_month_options():
 
 
 # --------------------------------------------------------------------------------------
+# LIVE FLEET TRACKER — process a gate-out log (e.g. from a Google Sheet) into
+# currently-out / available counts, for real intraday spot-hire planning.
+# --------------------------------------------------------------------------------------
+def process_gate_out_log(df, as_of_date):
+    """
+    df must have columns: 'Vehicle Number', 'Ownership', 'Gate Out Date',
+    optionally 'Actual Return Date' and 'Expected Return Date'.
+
+    A vehicle is "currently out" as of as_of_date if its Gate Out Date <= as_of_date
+    AND (Actual Return Date is blank OR Actual Return Date > as_of_date).
+
+    Returns (processed_df, currently_out_df) — processed_df has a boolean 'Currently Out'
+    and integer 'Days Out' column; currently_out_df is filtered to only vehicles still out.
+    """
+    d = df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
+    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce").dt.date
+    if "Actual Return Date" in d.columns:
+        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce").dt.date
+    else:
+        d["Actual Return Date"] = pd.NaT
+
+    d = d.dropna(subset=["Gate Out Date"])
+    d["Currently Out"] = d.apply(
+        lambda r: (r["Gate Out Date"] <= as_of_date) and
+                  (pd.isna(r["Actual Return Date"]) or r["Actual Return Date"] > as_of_date),
+        axis=1
+    )
+    d["Days Out"] = d.apply(
+        lambda r: (as_of_date - r["Gate Out Date"]).days if r["Currently Out"] else None, axis=1
+    )
+    currently_out_df = d[d["Currently Out"]].copy()
+    return d, currently_out_df
+
+
+# --------------------------------------------------------------------------------------
+# FREQUENCY-BASED DAY SCHEDULING — the key fix: distributors visited less often should
+# genuinely NOT need a truck on their off-days, instead of averaging total need flatly
+# across every working day (which erases the benefit of the frequency model).
+# --------------------------------------------------------------------------------------
+def compute_frequency_daily_schedule(f, working_days_per_week, weeks_in_month):
+    """
+    Assigns each distributor to specific day-of-week slots based on its TripsPerWeek
+    (e.g. 2/week -> serviced on 2 of the working days each week, not all of them), then
+    sums TrucksPerTrip only on the days each distributor is actually scheduled.
+
+    Distributors sharing the same frequency are staggered across different day-of-week
+    offsets (like real route planning assigns different "Monday routes", "Tuesday routes",
+    etc.) so lower-frequency distributors spread evenly across the week instead of all
+    piling onto the exact same 2 days and creating artificial demand spikes.
+
+    Returns a list of whole-number daily truck requirements, one per working day of
+    the month (length = round(working_days_per_week * weeks_in_month)).
+    """
+    wdw = max(1, int(round(working_days_per_week)))
+    total_days = max(1, int(round(wdw * weeks_in_month)))
+    daily_totals = [0.0] * total_days
+
+    for i, (_, row) in enumerate(f.iterrows()):
+        trucks_per_trip = row.get("TrucksPerTrip", None)
+        trips_per_week = row.get("TripsPerWeek", None)
+        if pd.isna(trucks_per_trip) or pd.isna(trips_per_week):
+            continue
+        trucks_per_trip = float(trucks_per_trip)
+        k = max(1, min(wdw, int(round(trips_per_week))))
+
+        # stagger the starting offset per distributor so same-frequency distributors
+        # don't all land on the identical days — spreads route load across the week
+        offset = i % wdw
+        day_slots = sorted(set((offset + int(round(j * wdw / k))) % wdw for j in range(k)))
+
+        for day_idx in range(total_days):
+            if (day_idx % wdw) in day_slots:
+                daily_totals[day_idx] += trucks_per_trip
+
+    return [int(round(x)) for x in daily_totals]
+
+
+# --------------------------------------------------------------------------------------
 # FLEET TOTALS (Own vs Fixed/Bachat) — used by the priority + TAT allocation simulator
 # --------------------------------------------------------------------------------------
 def fleet_totals_by_ownership(veh_db):
