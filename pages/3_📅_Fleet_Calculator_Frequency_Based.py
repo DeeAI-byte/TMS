@@ -10,7 +10,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_loader import (
     build_master_table, load_assumptions, load_vehicle_database,
     cases_per_truck, best_truck_for_tonnage_limit, get_month_options,
-    fleet_totals_by_ownership, simulate_daily_allocation, compute_frequency_daily_schedule
+    fleet_totals_by_ownership, simulate_daily_allocation, compute_frequency_daily_schedule,
+    allocate_trucks_by_tonnage
 )
 
 st.set_page_config(page_title="Fleet Calculator | Frequency Based", page_icon="📅", layout="wide")
@@ -76,6 +77,11 @@ st.sidebar.caption("June actuals suggest real trucks may carry closer to ~810 ca
 edited_veh_block = st.sidebar.data_editor(
     veh_block, num_rows="dynamic", use_container_width=True, key="veh_block_freq"
 )
+buffer_cases = st.sidebar.number_input(
+    "Overload buffer per truck (cases)", min_value=0, value=100, step=10, key="buffer_freq",
+    help="Extra cases a truck can carry beyond its rated capacity before a second truck is added — "
+         "avoids sending 2 trucks when 1 nearly suffices (e.g. 1,100 cases on a 1,000-case truck)."
+)
 
 st.sidebar.write("---")
 st.sidebar.header("🔄 Fleet Priority & TAT")
@@ -137,17 +143,18 @@ f["TripsPerWeek"] = freqs.apply(lambda x: x[1])
 f["TripsPerMonth"] = np.ceil(f["TripsPerWeek"] * weeks_in_month)
 f["LoadPerTrip"] = np.ceil(f["MonthlyTarget"] / f["TripsPerMonth"])
 
-f["RecommendedTruckTonnage"] = f["MaxVehicleTonnage"].apply(
-    lambda x: best_truck_for_tonnage_limit(x, fleet_tonnages)
-)
-f["TruckCaseCapacity"] = f["RecommendedTruckTonnage"].apply(
-    lambda t: round(cases_per_truck(t, edited_veh_block))
-)
-f["TrucksPerTrip"] = np.ceil(f["LoadPerTrip"] / f["TruckCaseCapacity"]).replace([np.inf, -np.inf], np.nan)
+def _plan_row_f(row):
+    plan, count = allocate_trucks_by_tonnage(row["LoadPerTrip"], edited_veh_block, row["MaxVehicleTonnage"], buffer_cases)
+    label = ", ".join(f"{v}x {k}" for k, v in plan.items()) if plan else "—"
+    return pd.Series({"TrucksPerTrip": count, "Truck Plan": label})
+
+_plan_result_f = f.apply(_plan_row_f, axis=1)
+f["TrucksPerTrip"] = _plan_result_f["TrucksPerTrip"]
+f["Truck Plan"] = _plan_result_f["Truck Plan"]
 f["TotalVehiclesPerMonth"] = f["TrucksPerTrip"] * f["TripsPerMonth"]
 
 # whole numbers only — no fractional cases, trips, or trucks
-for c in ["MonthlyTarget", "TripsPerMonth", "LoadPerTrip", "TruckCaseCapacity", "TrucksPerTrip", "TotalVehiclesPerMonth"]:
+for c in ["MonthlyTarget", "TripsPerMonth", "LoadPerTrip", "TrucksPerTrip", "TotalVehiclesPerMonth"]:
     f[c] = f[c].fillna(0).round(0).astype(int)
 
 # ---------------- KPI CARDS ----------------
@@ -198,14 +205,13 @@ st.subheader("📋 Distributor-wise Frequency & Truck Requirement")
 
 display_cols = [
     "DBR CODE", "Distributor", "Town", "District", "MaxVehicleTonnage", "MonthlyTarget",
-    "Frequency", "TripsPerMonth", "LoadPerTrip", "RecommendedTruckTonnage",
-    "TruckCaseCapacity", "TrucksPerTrip", "TotalVehiclesPerMonth"
+    "Frequency", "TripsPerMonth", "LoadPerTrip", "Truck Plan",
+    "TrucksPerTrip", "TotalVehiclesPerMonth"
 ]
 st.dataframe(
     f[display_cols].sort_values("MonthlyTarget", ascending=False).style.format({
         "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "TripsPerMonth": "{:,.0f}",
-        "LoadPerTrip": "{:,.0f}", "RecommendedTruckTonnage": "{:,.0f}",
-        "TruckCaseCapacity": "{:,.0f}", "TrucksPerTrip": "{:,.0f}", "TotalVehiclesPerMonth": "{:,.0f}"
+        "LoadPerTrip": "{:,.0f}", "TrucksPerTrip": "{:,.0f}", "TotalVehiclesPerMonth": "{:,.0f}"
     }, na_rep="—"),
     use_container_width=True, height=420
 )

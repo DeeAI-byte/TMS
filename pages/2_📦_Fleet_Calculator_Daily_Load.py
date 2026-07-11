@@ -10,7 +10,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_loader import (
     build_master_table, load_assumptions, load_vehicle_database,
     cases_per_truck, best_truck_for_tonnage_limit, get_month_options,
-    fleet_totals_by_ownership, simulate_daily_allocation
+    fleet_totals_by_ownership, simulate_daily_allocation, allocate_trucks_by_tonnage
 )
 
 st.set_page_config(page_title="Fleet Calculator | Daily Load", page_icon="📦", layout="wide")
@@ -44,6 +44,11 @@ st.sidebar.caption("June actuals suggest real trucks may carry closer to ~810 ca
                     "~747 implied by these defaults) — worth nudging up if this consistently under-predicts.")
 edited_veh_block = st.sidebar.data_editor(
     veh_block, num_rows="dynamic", use_container_width=True, key="veh_block_daily"
+)
+buffer_cases = st.sidebar.number_input(
+    "Overload buffer per truck (cases)", min_value=0, value=100, step=10, key="buffer_daily",
+    help="Extra cases a truck can carry beyond its rated capacity before a second truck is added — "
+         "avoids sending 2 trucks when 1 nearly suffices (e.g. 1,100 cases on a 1,000-case truck)."
 )
 
 st.sidebar.write("---")
@@ -93,18 +98,19 @@ f = f.dropna(subset=[sel_month]).copy()
 f["MonthlyTarget"] = f[sel_month].round(0)
 f["DailyAvgLoad"] = np.ceil(f["MonthlyTarget"] / working_days)
 
-f["RecommendedTruckTonnage"] = f["MaxVehicleTonnage"].apply(
-    lambda x: best_truck_for_tonnage_limit(x, fleet_tonnages)
-)
-f["TruckCaseCapacity"] = f["RecommendedTruckTonnage"].apply(
-    lambda t: round(cases_per_truck(t, edited_veh_block))
-)
-f["TrucksPerDay"] = np.ceil(f["DailyAvgLoad"] / f["TruckCaseCapacity"]).replace([np.inf, -np.inf], np.nan)
+def _plan_row(row):
+    plan, count = allocate_trucks_by_tonnage(row["DailyAvgLoad"], edited_veh_block, row["MaxVehicleTonnage"], buffer_cases)
+    label = ", ".join(f"{v}x {k}" for k, v in plan.items()) if plan else "—"
+    return pd.Series({"TrucksPerDay": count, "Truck Plan": label})
+
+_plan_result = f.apply(_plan_row, axis=1)
+f["TrucksPerDay"] = _plan_result["TrucksPerDay"]
+f["Truck Plan"] = _plan_result["Truck Plan"]
 f["VehiclesPerMonth"] = f["TrucksPerDay"] * working_days
 f["MTD Target (cumulative)"] = f["MonthlyTarget"]  # full month reference for MTD tracking table below
 
 # whole numbers only — no fractional cases or trucks
-for c in ["MonthlyTarget", "DailyAvgLoad", "TruckCaseCapacity", "TrucksPerDay", "VehiclesPerMonth"]:
+for c in ["MonthlyTarget", "DailyAvgLoad", "TrucksPerDay", "VehiclesPerMonth"]:
     f[c] = f[c].fillna(0).round(0).astype(int)
 
 # ---------------- KPI CARDS ----------------
@@ -112,7 +118,7 @@ total_daily_load = f["DailyAvgLoad"].sum()
 total_trucks_per_day_raw = f["TrucksPerDay"].sum()
 total_trucks_per_day = int(round(total_trucks_per_day_raw * consolidation_factor_pct / 100))
 total_monthly_target = f["MonthlyTarget"].sum()
-avg_util = (f["DailyAvgLoad"] / (f["TrucksPerDay"] * f["TruckCaseCapacity"])).replace([np.inf, -np.inf], np.nan).mean()
+avg_util = (f["DailyAvgLoad"] / (f["TrucksPerDay"].replace(0, np.nan) * (edited_veh_block["Capacity"].mean() + buffer_cases))).replace([np.inf, -np.inf], np.nan).mean()
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric(f"{sel_month.title()} Target (cases)", f"{int(total_monthly_target):,}")
@@ -137,11 +143,11 @@ with c1:
         st.plotly_chart(fig, use_container_width=True)
 
 with c2:
-    st.subheader("📊 Recommended Truck Size Mix")
-    mix = f["RecommendedTruckTonnage"].value_counts().reset_index()
-    mix.columns = ["Truck Tonnage", "Distributors"]
+    st.subheader("📊 Truck Plan Mix (closest-fit tonnage)")
+    mix = f["Truck Plan"].value_counts().reset_index()
+    mix.columns = ["Truck Plan", "Distributors"]
     if not mix.empty:
-        fig2 = px.pie(mix, names="Truck Tonnage", values="Distributors", hole=0.45)
+        fig2 = px.pie(mix, names="Truck Plan", values="Distributors", hole=0.45)
         fig2.update_layout(height=380, margin=dict(t=10))
         st.plotly_chart(fig2, use_container_width=True)
 
@@ -156,13 +162,12 @@ st.subheader("📋 Distributor-wise Daily Load & Truck Requirement")
 
 display_cols = [
     "DBR CODE", "Distributor", "Town", "District", "MaxVehicleTonnage",
-    "MonthlyTarget", "DailyAvgLoad", "RecommendedTruckTonnage", "TruckCaseCapacity",
+    "MonthlyTarget", "DailyAvgLoad", "Truck Plan",
     "TrucksPerDay", "VehiclesPerMonth"
 ]
 st.dataframe(
     f[display_cols].sort_values("DailyAvgLoad", ascending=False).style.format({
         "MaxVehicleTonnage": "{:,.0f}", "MonthlyTarget": "{:,.0f}", "DailyAvgLoad": "{:,.0f}",
-        "RecommendedTruckTonnage": "{:,.0f}", "TruckCaseCapacity": "{:,.0f}",
         "TrucksPerDay": "{:,.0f}", "VehiclesPerMonth": "{:,.0f}"
     }, na_rep="—"),
     use_container_width=True, height=420
@@ -171,12 +176,15 @@ st.dataframe(
 with st.expander("ℹ️ Methodology"):
     st.markdown(f"""
     1. **Daily Avg Load** = Monthly Target ({sel_month.title()}) ÷ Working Days ({working_days})
-    2. **Recommended Truck** = largest truck size in your fleet that is still ≤ the distributor's
-       *Max Capacity Vehicle* limit (the biggest truck physically allowed to reach that point).
-    3. **Truck Case Capacity** = interpolated from the Truck size ↔ Case capacity table in the sidebar
-       (edit it if your real per-truck case capacities differ).
-    4. **Trucks/Day** = ROUNDUP( Daily Avg Load ÷ Truck Case Capacity )
-    5. **Trucks/Month** = Trucks/Day × Working Days (total vehicle dispatches needed across the month)
+    2. **Truck Plan** = the smallest truck (from the sidebar's size ↔ capacity table) that alone
+       covers the Daily Avg Load **plus a {buffer_cases}-case overload buffer**, without exceeding
+       the distributor's *Max Capacity Vehicle* limit. If the load exceeds even the largest allowed
+       truck (+ buffer), it uses as many of that largest size as needed.
+    3. **Trucks/Day** = number of trucks in that Truck Plan.
+    4. **Vehicles/Month** = Trucks/Day × Working Days (total vehicle dispatches needed across the month)
+
+    The overload buffer avoids wasteful rounding — e.g. 1,100 cases on a 1,000-case truck needs
+    just **1** truck (not 2), since the extra 100 cases fit within the buffer.
 
     This page assumes **flat daily dispatch** — no delivery-frequency logic. Use the
     *Frequency Based* calculator if deliveries don't happen every working day.

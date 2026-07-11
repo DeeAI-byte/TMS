@@ -10,7 +10,8 @@ from datetime import date
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_loader import (
     load_vehicle_database, fleet_totals_by_ownership, load_assumptions,
-    process_gate_out_log, cross_reference_fleet
+    process_gate_out_log, cross_reference_fleet, validate_ownership_values,
+    allocate_trucks_by_tonnage
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -35,7 +36,8 @@ st.sidebar.header("🔗 Gate-Out Log Source")
 sheet_url = st.sidebar.text_input(
     "Google Sheet CSV link",
     placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-    help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link."
+    help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link.",
+    key="live_gate_sheet_url"
 )
 as_of_date = st.sidebar.date_input("As of date", value=date.today())
 refresh = st.sidebar.button("🔄 Refresh Now", use_container_width=True)
@@ -66,14 +68,15 @@ with st.sidebar.expander("📋 Required gate-out log columns"):
 
 st.sidebar.write("---")
 st.sidebar.header("📦 Today's Load")
-load_mode = st.sidebar.radio("Load input method", ["Manual Entry", "From Google Sheet"])
+load_mode = st.sidebar.radio("Load input method", ["Manual Entry", "From Google Sheet"], key="live_load_mode")
 
 load_sheet_url = None
 if load_mode == "From Google Sheet":
     load_sheet_url = st.sidebar.text_input(
         "Load Log Sheet CSV link",
         placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-        help="Needs columns: Date, Total Load (cases). One row per day."
+        help="Needs columns: Date, Total Load (cases). One row per day.",
+        key="live_load_sheet_url"
     )
     with st.sidebar.expander("📋 Load Log sheet columns"):
         st.markdown("- **Date**\n- **Total Load (cases)**")
@@ -85,9 +88,18 @@ if load_mode == "From Google Sheet":
             mime="text/csv"
         )
 
-truck_capacity = st.sidebar.number_input(
-    "Avg truck capacity (cases/truck)", min_value=1, value=default_truck_capacity, step=10,
-    help="Used to convert today's case load into trucks needed."
+st.sidebar.write("---")
+st.sidebar.write("**Truck size ↔ Case capacity** (editable)")
+edited_veh_block_live = st.sidebar.data_editor(
+    veh_block, num_rows="dynamic", use_container_width=True, key="veh_block_live"
+)
+buffer_cases_live = st.sidebar.number_input(
+    "Overload buffer per truck (cases)", min_value=0, value=100, step=10, key="buffer_live",
+    help="Extra cases a truck can carry beyond its rated capacity before a second truck is added."
+)
+max_tonnage_live = st.sidebar.number_input(
+    "Max tonnage available today (optional cap)", min_value=0, value=0, step=1, key="max_tonnage_live",
+    help="Leave at 0 for no cap — uses the largest size in the table above if needed."
 )
 
 # ---------------- LOAD GATE-OUT LOG ----------------
@@ -156,6 +168,14 @@ has_log_data = (log_df is not None and not log_df.empty and
                 required_cols.issubset(set(str(c).strip() for c in log_df.columns)))
 
 if has_log_data:
+    bad_ownership_values = validate_ownership_values(log_df)
+    if bad_ownership_values:
+        st.error(
+            f"🚫 **Data problem in your sheet's Ownership column:** found value(s) {bad_ownership_values} "
+            f"that aren't **Own** or **Fixed**. Those rows won't count toward availability until fixed — "
+            f"a common mistake is typing the column header text into the cells by accident. Please correct "
+            f"the Ownership column in your Google Sheet to say exactly `Own` or `Fixed`."
+        )
     processed_df, currently_out_df = process_gate_out_log(log_df, as_of_date)
 else:
     currently_out_df = pd.DataFrame(columns=["Vehicle Number", "Ownership", "Days Out"])
@@ -258,7 +278,7 @@ with st.container(border=True):
             try:
                 load_log_df = fetch_sheet(load_sheet_url)
                 load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
-                load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce").dt.date
+                load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
                 match = load_log_df[load_log_df["Date"] == as_of_date]
                 if not match.empty:
                     load_today = int(match.iloc[0]["Total Load (cases)"])
@@ -276,9 +296,14 @@ with st.container(border=True):
             load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000)
             load_source_note = "manual fallback"
 
-    trucks_needed_today = int(math.ceil(load_today / truck_capacity)) if truck_capacity > 0 else 0
-    st.caption(f"Load source: **{load_source_note}** · {load_today:,} cases ÷ {truck_capacity:,} cases/truck "
-               f"→ **{trucks_needed_today:,} trucks needed today**")
+    truck_plan, trucks_needed_today = allocate_trucks_by_tonnage(
+        load_today, edited_veh_block_live,
+        max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
+        buffer=buffer_cases_live
+    )
+    plan_label = ", ".join(f"{v}x {k}" for k, v in truck_plan.items()) if truck_plan else "—"
+    st.caption(f"Load source: **{load_source_note}** · {load_today:,} cases (with a {buffer_cases_live}-case/truck "
+               f"buffer) → **{trucks_needed_today:,} trucks needed today**: {plan_label}")
 
     own_used_today = min(trucks_needed_today, own_available)
     remaining = trucks_needed_today - own_used_today
@@ -293,9 +318,11 @@ with st.container(border=True):
     d4.metric("🟥 Spot Hire Needed NOW", f"{spot_needed_today:,}")
 
     if trucks_needed_today > 0:
+        st.write(f"**Truck plan:** {plan_label}")
         if spot_needed_today > 0:
-            st.warning(f"⚠️ Arrange **{spot_needed_today} spot hire vehicles** today — Own + Fixed available "
-                       f"fleet ({own_available + fixed_available}) is short of the {trucks_needed_today:,} needed.")
+            st.warning(f"⚠️ Arrange **{spot_needed_today} spot hire vehicles** today (matching the tonnage plan "
+                       f"above where possible) — Own + Fixed available fleet ({own_available + fixed_available}) "
+                       f"is short of the {trucks_needed_today:,} needed.")
         else:
             st.success("✅ Own + Fixed availability covers today's need — no spot hire required.")
 

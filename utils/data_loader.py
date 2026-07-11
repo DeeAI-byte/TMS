@@ -7,6 +7,7 @@ here, so numbers stay consistent across pages.
 """
 
 import os
+import math
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -158,6 +159,45 @@ def get_month_options():
 
 
 # --------------------------------------------------------------------------------------
+# CLOSEST-TONNAGE TRUCK ALLOCATION (with overload buffer)
+# --------------------------------------------------------------------------------------
+def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0):
+    """
+    Picks the best-fit truck(s) for a given case load:
+    - Only considers truck sizes <= max_tonnage (the distributor/route's vehicle limit),
+      falling back to all sizes if none qualify.
+    - `buffer` cases of tolerated overload are added to each truck's rated capacity before
+      checking fit — e.g. a 1000-case truck with a 100-case buffer can cover an 1100-case
+      load as ONE truck instead of forcing a second truck for the last 100 cases.
+    - Prefers the SMALLEST truck that alone covers the load (closest fit, not oversized).
+    - If the load exceeds even the largest available truck (+ buffer), uses as many of the
+      largest truck as needed.
+
+    Returns (plan_dict, total_trucks) where plan_dict maps a truck label (e.g. "20T") to
+    how many of that size are needed.
+    """
+    if load is None or pd.isna(load) or load <= 0 or veh_block is None or len(veh_block) == 0:
+        return {}, 0
+
+    options = veh_block.copy()
+    if max_tonnage is not None and pd.notna(max_tonnage):
+        eligible = options[options["TonnageNum"] <= max_tonnage + 1e-6]
+        if len(eligible) > 0:
+            options = eligible
+    options = options.sort_values("TonnageNum")
+
+    for _, row in options.iterrows():
+        cap = row["Capacity"] + buffer
+        if load <= cap:
+            return {row["Vehicle"]: 1}, 1
+
+    largest = options.iloc[-1]
+    cap = largest["Capacity"] + buffer
+    count = int(math.ceil(load / cap)) if cap > 0 else 0
+    return {largest["Vehicle"]: count}, count
+
+
+# --------------------------------------------------------------------------------------
 # LIVE FLEET TRACKER — process a gate-out log (e.g. from a Google Sheet) into
 # currently-out / available counts, for real intraday spot-hire planning.
 # --------------------------------------------------------------------------------------
@@ -169,6 +209,8 @@ def process_gate_out_log(df, as_of_date):
     A vehicle is "currently out" as of as_of_date if its Gate Out Date <= as_of_date
     AND (Actual Return Date is blank OR Actual Return Date > as_of_date).
 
+    Dates are parsed day-first (DD-MM-YYYY), matching Indian date conventions.
+
     Returns (processed_df, currently_out_df) — processed_df has a boolean 'Currently Out'
     and integer 'Days Out' column; currently_out_df is filtered to only vehicles still out.
     """
@@ -176,9 +218,9 @@ def process_gate_out_log(df, as_of_date):
     d.columns = [str(c).strip() for c in d.columns]
     d["Vehicle Number"] = d["Vehicle Number"].astype(str).str.strip().str.upper()
     d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
-    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce").dt.date
+    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True).dt.date
     if "Actual Return Date" in d.columns:
-        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce").dt.date
+        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True).dt.date
     else:
         d["Actual Return Date"] = pd.NaT
 
@@ -193,6 +235,18 @@ def process_gate_out_log(df, as_of_date):
     )
     currently_out_df = d[d["Currently Out"]].copy()
     return d, currently_out_df
+
+
+def validate_ownership_values(df):
+    """
+    Returns the set of distinct 'Ownership' values in the log that DON'T match
+    'Own' or 'Fixed' (case-insensitive) — a common data-entry mistake (e.g. someone
+    typing the column header 'Ownership' into the cells instead of an actual value).
+    """
+    if df is None or df.empty or "Ownership" not in df.columns:
+        return []
+    vals = df["Ownership"].astype(str).str.strip().str.title().unique().tolist()
+    return [v for v in vals if v not in ("Own", "Fixed")]
 
 
 def cross_reference_fleet(veh_db, currently_out_df):
