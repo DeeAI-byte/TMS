@@ -7,3 +7,4 @@ streamlit-folium==0.22.0
 requests==2.32.3
 plotly==5.22.0
 pyarrow==16.1.0
+setuptools
