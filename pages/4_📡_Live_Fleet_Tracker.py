@@ -33,10 +33,15 @@ except Exception as e:
 
 # ---------------- SIDEBAR CONFIG ----------------
 st.sidebar.header("🔗 Gate-Out Log Source")
+
+DEFAULT_GATE_OUT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT_DAK4PWeK2FILTKwXEpPkMMUIcj1cQ41e62bM4754358aoCNvDwxEP_RYLeihRB1A_3k3nXIB_wm7/pub?gid=0&single=true&output=csv"
+
 sheet_url = st.sidebar.text_input(
     "Google Sheet CSV link",
+    value=DEFAULT_GATE_OUT_SHEET_URL,
     placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-    help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link.",
+    help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link. "
+         "Pre-filled with your default sheet — change it here if you ever need a different one.",
     key="live_gate_sheet_url"
 )
 as_of_date = st.sidebar.date_input("As of date", value=date.today(), key="live_as_of_date")
