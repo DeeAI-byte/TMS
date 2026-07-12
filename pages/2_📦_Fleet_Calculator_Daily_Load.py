@@ -35,8 +35,8 @@ own_total_default, fixed_total_default = fleet_totals_by_ownership(veh_db)
 
 # ---------------- SIDEBAR CONFIG ----------------
 st.sidebar.header("⚙️ Calculator Settings")
-sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"))
-working_days = st.sidebar.number_input("Working days in month", min_value=1, max_value=31, value=26)
+sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"), key="dl_month")
+working_days = st.sidebar.number_input("Working days in month", min_value=1, max_value=31, value=26, key="dl_working_days")
 
 st.sidebar.write("---")
 st.sidebar.write("**Truck size ↔ Case capacity** (editable)")
@@ -81,8 +81,8 @@ st.sidebar.caption(f"→ Effective pool used in calculations: **{own_total} Own*
 
 st.sidebar.write("---")
 districts = sorted(master["District"].dropna().unique())
-sel_districts = st.sidebar.multiselect("Filter: District", districts, default=[])
-search_term = st.sidebar.text_input("🔍 Search distributor", "")
+sel_districts = st.sidebar.multiselect("Filter: District", districts, default=[], key="dl_districts")
+search_term = st.sidebar.text_input("🔍 Search distributor", "", key="dl_search")
 
 # ---------------- FILTER ----------------
 f = master.copy()

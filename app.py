@@ -34,22 +34,22 @@ MONTHS = get_month_options()
 st.sidebar.header("🔎 Filters")
 
 districts = sorted(master["District"].dropna().unique())
-sel_districts = st.sidebar.multiselect("District", districts, default=[])
+sel_districts = st.sidebar.multiselect("District", districts, default=[], key="ov_districts")
 
 towns_pool = master[master["District"].isin(sel_districts)]["Town"] if sel_districts else master["Town"]
 towns = sorted(towns_pool.dropna().unique())
-sel_towns = st.sidebar.multiselect("Town / Area", towns, default=[])
+sel_towns = st.sidebar.multiselect("Town / Area", towns, default=[], key="ov_towns")
 
 channels = sorted(master["Channel"].dropna().unique())
-sel_channels = st.sidebar.multiselect("Channel (Dsd/Hub/MT/LKA)", channels, default=[])
+sel_channels = st.sidebar.multiselect("Channel (Dsd/Hub/MT/LKA)", channels, default=[], key="ov_channels")
 
 transporters = sorted(veh["Transporter Name"].dropna().unique())
-sel_transporters = st.sidebar.multiselect("Transporter", transporters, default=[])
+sel_transporters = st.sidebar.multiselect("Transporter", transporters, default=[], key="ov_transporters")
 
-sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"))
+sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"), key="ov_month")
 
 st.sidebar.write("---")
-search_term = st.sidebar.text_input("🔍 Search distributor by name / code", "")
+search_term = st.sidebar.text_input("🔍 Search distributor by name / code", "", key="ov_search")
 
 # ---------------- APPLY FILTERS ----------------
 f = master.copy()

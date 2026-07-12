@@ -39,7 +39,7 @@ sheet_url = st.sidebar.text_input(
     help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link.",
     key="live_gate_sheet_url"
 )
-as_of_date = st.sidebar.date_input("As of date", value=date.today())
+as_of_date = st.sidebar.date_input("As of date", value=date.today(), key="live_as_of_date")
 refresh = st.sidebar.button("🔄 Refresh Now", use_container_width=True)
 
 with st.sidebar.expander("📋 Required gate-out log columns"):
@@ -271,7 +271,7 @@ with st.container(border=True):
     load_today = 0
     load_source_note = ""
     if load_mode == "Manual Entry":
-        load_today = st.number_input("Total load today (cases)", min_value=0, value=0, step=1000)
+        load_today = st.number_input("Total load today (cases)", min_value=0, value=0, step=1000, key="live_load_manual")
         load_source_note = "manual entry"
     else:
         if load_sheet_url:
@@ -285,15 +285,15 @@ with st.container(border=True):
                     load_source_note = "Google Sheet"
                 else:
                     st.warning(f"⚠️ No row found for {as_of_date} in the Load Log sheet — enter manually below.")
-                    load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000)
+                    load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000, key="live_load_fallback1")
                     load_source_note = "manual fallback"
             except Exception as e:
                 st.error(f"⚠️ Couldn't read Load Log sheet ({e}). Enter manually below.")
-                load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000)
+                load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000, key="live_load_fallback2")
                 load_source_note = "manual fallback"
         else:
             st.info("Add a Load Log Sheet link in the sidebar, or switch to Manual Entry.")
-            load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000)
+            load_today = st.number_input("Total load today (cases) — fallback", min_value=0, value=0, step=1000, key="live_load_fallback3")
             load_source_note = "manual fallback"
 
     truck_plan, trucks_needed_today = allocate_trucks_by_tonnage(

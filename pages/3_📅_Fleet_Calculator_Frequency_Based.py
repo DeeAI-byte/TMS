@@ -59,9 +59,9 @@ freq_block["Trips/Week"] = freq_block["Frequency"].map(DEFAULT_FREQ_MAP).fillna(
 
 # ---------------- SIDEBAR CONFIG ----------------
 st.sidebar.header("⚙️ Calculator Settings")
-sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"))
-working_days_per_week = st.sidebar.number_input("Working days per week", min_value=1, max_value=7, value=6)
-weeks_in_month = st.sidebar.number_input("Weeks in month", min_value=1.0, max_value=6.0, value=4.33, step=0.01)
+sel_month = st.sidebar.selectbox("Target Month", MONTHS, index=MONTHS.index("JULY"), key="fq_month")
+working_days_per_week = st.sidebar.number_input("Working days per week", min_value=1, max_value=7, value=6, key="fq_wdw")
+weeks_in_month = st.sidebar.number_input("Weeks in month", min_value=1.0, max_value=6.0, value=4.33, step=0.01, key="fq_wim")
 
 st.sidebar.write("---")
 st.sidebar.write("**MTD Volume ➜ Frequency brackets** (editable)")
@@ -114,8 +114,8 @@ consolidation_factor_pct = st.sidebar.slider(
          "70% is calibrated from June actuals — adjust as more months validate it."
 )
 districts = sorted(master["District"].dropna().unique())
-sel_districts = st.sidebar.multiselect("Filter: District", districts, default=[])
-search_term = st.sidebar.text_input("🔍 Search distributor", "")
+sel_districts = st.sidebar.multiselect("Filter: District", districts, default=[], key="fq_districts")
+search_term = st.sidebar.text_input("🔍 Search distributor", "", key="fq_search")
 
 # ---------------- FILTER ----------------
 f = master.copy()
