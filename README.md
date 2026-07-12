@@ -41,6 +41,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+**Note on dependency versions:** `requirements.txt` pins specific, tested-compatible
+versions (Streamlit 1.38, pandas 2.2, numpy 1.26, pyarrow 16, etc.) rather than leaving
+them unpinned. Unpinned requirements let the host resolve to the newest releases at
+deploy time, which can pull in incompatible native-library combinations (e.g. a very new
+pandas/numpy/pyarrow trio) and cause hard crashes (segfaults) rather than clean Python
+errors. If you ever upgrade a package here, test it locally first — a crashed server
+wipes all in-memory session state for every user (which is also why a Google Sheet link
+in the sidebar can appear to "vanish": the server restarted, not the sheet itself).
+
 ## Push to your existing GitHub repo
 
 Since you already have a live Route Creation app on GitHub, drop these files into
