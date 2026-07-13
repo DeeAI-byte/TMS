@@ -8,6 +8,7 @@ here, so numbers stay consistent across pages.
 
 import os
 import math
+import itertools
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -161,17 +162,21 @@ def get_month_options():
 # --------------------------------------------------------------------------------------
 # CLOSEST-TONNAGE TRUCK ALLOCATION (with overload buffer)
 # --------------------------------------------------------------------------------------
-def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0):
+def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_combo_size=6):
     """
     Picks the best-fit truck(s) for a given case load:
     - Only considers truck sizes <= max_tonnage (the distributor/route's vehicle limit),
       falling back to all sizes if none qualify.
-    - `buffer` cases of tolerated overload are added to each truck's rated capacity before
-      checking fit — e.g. a 1000-case truck with a 100-case buffer can cover an 1100-case
-      load as ONE truck instead of forcing a second truck for the last 100 cases.
-    - Prefers the SMALLEST truck that alone covers the load (closest fit, not oversized).
-    - If the load exceeds even the largest available truck (+ buffer), uses as many of the
-      largest truck as needed.
+    - `buffer` cases of tolerated overload let a SINGLE truck absorb a small overage —
+      e.g. a 1000-case truck with a 100-case buffer covers an 1100-case load as ONE truck
+      instead of forcing a second truck for the last 100 cases.
+    - If no single truck (+ buffer) covers the load, searches combinations of 2 or more
+      trucks — ANY sizes, not just the largest — for the tightest-fitting combination
+      (least wasted capacity). E.g. a 1200-case load prefers two 9T trucks (600 each =
+      1200, exact fit) over two 20T trucks, if 9T trucks are an available size.
+    - For loads far beyond what a few combined trucks can cover, falls back to as many
+      of the largest truck as needed (searching every combination stops being practical
+      at that scale, and repeated largest-truck is already near-optimal for bulk volume).
 
     Returns (plan_dict, total_trucks) where plan_dict maps a truck label (e.g. "20T") to
     how many of that size are needed.
@@ -186,11 +191,29 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0):
             options = eligible
     options = options.sort_values("TonnageNum")
 
+    # Step 1: does a single truck (+ buffer) cover it alone?
     for _, row in options.iterrows():
         cap = row["Capacity"] + buffer
         if load <= cap:
             return {row["Vehicle"]: 1}, 1
 
+    # Step 2: search increasing truck counts for the tightest-fitting combination of ANY sizes
+    sizes = list(zip(options["Vehicle"], options["Capacity"]))
+    for count in range(2, max_combo_size + 1):
+        best_combo, best_excess = None, None
+        for combo in itertools.combinations_with_replacement(sizes, count):
+            total_cap = sum(cap for _, cap in combo)
+            if total_cap >= load:
+                excess = total_cap - load
+                if best_excess is None or excess < best_excess:
+                    best_combo, best_excess = combo, excess
+        if best_combo is not None:
+            plan = {}
+            for label, _ in best_combo:
+                plan[label] = plan.get(label, 0) + 1
+            return plan, count
+
+    # Step 3: fallback for very large loads — as many of the largest truck as needed
     largest = options.iloc[-1]
     cap = largest["Capacity"] + buffer
     count = int(math.ceil(load / cap)) if cap > 0 else 0
