@@ -73,34 +73,32 @@ with st.sidebar.expander("📋 Required gate-out log columns"):
 
 st.sidebar.write("---")
 st.sidebar.header("📦 Today's Load")
-load_mode = st.sidebar.radio("Load input method", ["Manual Entry", "From Google Sheet"], key="live_load_mode")
 
-load_sheet_url = None
-if load_mode == "From Google Sheet":
-    DEFAULT_LOAD_LOG_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTb3o2Igm4sqyRwxdC4G3XA-C3M8tGp20SWKxqqxAcgJVjOdq33K5d7ARQmjIqlw9y7847Qw4qhDdVJ/pub?output=csv"
-    load_sheet_url = st.sidebar.text_input(
-        "Load Log Sheet CSV link",
-        value=DEFAULT_LOAD_LOG_SHEET_URL,
-        placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-        help="Needs columns: Date, Route / Distributor, Total Load (cases). One row PER SHIPMENT — "
-             "multiple rows can share the same date. Pre-filled with your default sheet.",
-        key="live_load_sheet_url"
+DEFAULT_LOAD_LOG_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTb3o2Igm4sqyRwxdC4G3XA-C3M8tGp20SWKxqqxAcgJVjOdq33K5d7ARQmjIqlw9y7847Qw4qhDdVJ/pub?output=csv"
+load_sheet_url = st.sidebar.text_input(
+    "Load Log Sheet CSV link",
+    value=DEFAULT_LOAD_LOG_SHEET_URL,
+    placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
+    help="Needs columns: Date, Route / Distributor, Total Load (cases). One row PER SHIPMENT — "
+         "multiple rows can share the same date. Pre-filled with your default sheet.",
+    key="live_load_sheet_url"
+)
+load_refresh = st.sidebar.button("🔄 Refresh Now", use_container_width=True, key="load_refresh_btn")
+with st.sidebar.expander("📋 Load Log sheet columns"):
+    st.markdown("- **Date**\n- **Route / Distributor**\n- **Total Load (cases)**\n\n"
+                "One row per individual shipment, not one lump total per day — real loads are "
+                "different sizes, and each needs matching to the right truck.")
+    load_template = pd.DataFrame({
+        "Date": [str(date.today())] * 3,
+        "Route / Distributor": ["Route A", "Route B", "Route C"],
+        "Total Load (cases)": [600, 250, 3000],
+    })
+    st.download_button(
+        "⬇️ Download load log template (CSV)",
+        load_template.to_csv(index=False).encode("utf-8"),
+        file_name="load_log_template.csv",
+        mime="text/csv"
     )
-    with st.sidebar.expander("📋 Load Log sheet columns"):
-        st.markdown("- **Date**\n- **Route / Distributor**\n- **Total Load (cases)**\n\n"
-                    "One row per individual shipment, not one lump total per day — real loads are "
-                    "different sizes, and each needs matching to the right truck.")
-        load_template = pd.DataFrame({
-            "Date": [str(date.today())] * 3,
-            "Route / Distributor": ["Route A", "Route B", "Route C"],
-            "Total Load (cases)": [600, 250, 3000],
-        })
-        st.download_button(
-            "⬇️ Download load log template (CSV)",
-            load_template.to_csv(index=False).encode("utf-8"),
-            file_name="load_log_template.csv",
-            mime="text/csv"
-        )
 
 st.sidebar.write("---")
 st.sidebar.write("**Truck size ↔ Case capacity** (editable)")
@@ -288,50 +286,44 @@ with st.container(border=True):
     shipments_df = None
     load_source_note = ""
 
-    if load_mode == "Manual Entry":
-        if "manual_shipments_df" not in st.session_state:
-            st.session_state.manual_shipments_df = pd.DataFrame({
+    if load_refresh:
+        fetch_sheet.clear()
+
+    if load_sheet_url:
+        try:
+            load_log_df = fetch_sheet(load_sheet_url)
+            load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
+            load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
+            match = load_log_df[load_log_df["Date"] == as_of_date]
+            if not match.empty:
+                rename_map = {"Total Load (cases)": "Load (cases)"}
+                match = match.rename(columns=rename_map)
+                if "Route / Distributor" not in match.columns:
+                    match["Route / Distributor"] = [f"Row {i+1}" for i in range(len(match))]
+                shipments_df = match[["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
+                load_source_note = "Google Sheet"
+                st.dataframe(shipments_df, use_container_width=True, hide_index=True)
+            else:
+                available_dates = sorted(load_log_df["Date"].dropna().unique(), reverse=True)[:10]
+                dates_str = ", ".join(str(d) for d in available_dates) if len(available_dates) else "none found at all"
+                st.warning(f"⚠️ No rows found for **{as_of_date}** in the Load Log sheet — enter manually below. "
+                           f"Most recent dates actually in the sheet: {dates_str}")
+        except Exception as e:
+            st.error(f"⚠️ Couldn't read Load Log sheet ({e}).")
+    else:
+        st.info("Add a Load Log Sheet link in the sidebar.")
+
+    if shipments_df is None:
+        if "fallback_shipments_df" not in st.session_state:
+            st.session_state.fallback_shipments_df = pd.DataFrame({
                 "Route / Distributor": [""], "Load (cases)": [0]
             })
         shipments_df = st.data_editor(
-            st.session_state.manual_shipments_df, num_rows="dynamic", use_container_width=True,
-            key="manual_shipments_editor",
+            st.session_state.fallback_shipments_df, num_rows="dynamic", use_container_width=True,
+            key="fallback_shipments_editor",
             column_config={"Load (cases)": st.column_config.NumberColumn(min_value=0, step=100)}
         )
-        load_source_note = "manual entry"
-    else:
-        if load_sheet_url:
-            try:
-                load_log_df = fetch_sheet(load_sheet_url)
-                load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
-                load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
-                match = load_log_df[load_log_df["Date"] == as_of_date]
-                if not match.empty:
-                    rename_map = {"Total Load (cases)": "Load (cases)"}
-                    match = match.rename(columns=rename_map)
-                    if "Route / Distributor" not in match.columns:
-                        match["Route / Distributor"] = [f"Row {i+1}" for i in range(len(match))]
-                    shipments_df = match[["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
-                    load_source_note = "Google Sheet"
-                    st.dataframe(shipments_df, use_container_width=True, hide_index=True)
-                else:
-                    st.warning(f"⚠️ No rows found for {as_of_date} in the Load Log sheet — enter manually below.")
-            except Exception as e:
-                st.error(f"⚠️ Couldn't read Load Log sheet ({e}).")
-        else:
-            st.info("Add a Load Log Sheet link in the sidebar, or switch to Manual Entry.")
-
-        if shipments_df is None:
-            if "fallback_shipments_df" not in st.session_state:
-                st.session_state.fallback_shipments_df = pd.DataFrame({
-                    "Route / Distributor": [""], "Load (cases)": [0]
-                })
-            shipments_df = st.data_editor(
-                st.session_state.fallback_shipments_df, num_rows="dynamic", use_container_width=True,
-                key="fallback_shipments_editor",
-                column_config={"Load (cases)": st.column_config.NumberColumn(min_value=0, step=100)}
-            )
-            load_source_note = "manual fallback"
+        load_source_note = "manual fallback"
 
     shipment_loads = [x for x in shipments_df["Load (cases)"].tolist() if pd.notna(x) and x > 0] if shipments_df is not None else []
     total_load_today = int(sum(shipment_loads))
