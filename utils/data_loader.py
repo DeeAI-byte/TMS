@@ -159,6 +159,21 @@ def get_month_options():
     return MONTH_COLS
 
 
+def get_memory_usage_mb():
+    """
+    Returns the CURRENT process's real memory usage in MB (RSS — actual physical memory
+    in use), or None if psutil isn't available. This is the real number for this specific
+    running instance, not an estimate — memory can vary run to run depending on what data
+    is cached and how many browser sessions are connected.
+    """
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------------------
 # CLOSEST-TONNAGE TRUCK ALLOCATION (with overload buffer)
 # --------------------------------------------------------------------------------------

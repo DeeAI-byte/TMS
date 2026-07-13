@@ -77,11 +77,13 @@ load_mode = st.sidebar.radio("Load input method", ["Manual Entry", "From Google 
 
 load_sheet_url = None
 if load_mode == "From Google Sheet":
+    DEFAULT_LOAD_LOG_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vTb3o2Igm4sqyRwxdC4G3XA-C3M8tGp20SWKxqqxAcgJVjOdq33K5d7ARQmjIqlw9y7847Qw4qhDdVJ/pub?output=csv"
     load_sheet_url = st.sidebar.text_input(
         "Load Log Sheet CSV link",
+        value=DEFAULT_LOAD_LOG_SHEET_URL,
         placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
         help="Needs columns: Date, Route / Distributor, Total Load (cases). One row PER SHIPMENT — "
-             "multiple rows can share the same date.",
+             "multiple rows can share the same date. Pre-filled with your default sheet.",
         key="live_load_sheet_url"
     )
     with st.sidebar.expander("📋 Load Log sheet columns"):

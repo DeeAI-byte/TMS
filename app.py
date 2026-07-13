@@ -150,3 +150,23 @@ st.caption(
     "or search a distributor by name or DBR code. Head to the other pages for route "
     "planning and truck-requirement calculators."
 )
+
+with st.expander("🔧 App Diagnostics"):
+    from utils.data_loader import get_memory_usage_mb
+    mem_mb = get_memory_usage_mb()
+    if mem_mb is not None:
+        budget_mb = 1024  # Streamlit Community Cloud free tier default
+        pct = mem_mb / budget_mb * 100
+        st.metric("Current memory usage (this instance, right now)", f"{mem_mb:,.0f} MB / {budget_mb:,} MB",
+                  delta=f"{pct:.1f}% of budget")
+        st.caption(
+            "This is the ACTUAL memory this running instance is using right now — not an estimate. "
+            "It naturally rises with more connected users/browser tabs and cached data, and resets "
+            "on every app reboot. Your data files here are small (tens of KB), so the bulk of memory "
+            "is Streamlit + pandas + numpy + plotly + folium's own baseline overhead, which is normal "
+            "and typically the same order of magnitude regardless of how much of your own data is loaded. "
+            "If this consistently climbs toward the budget, the usual causes are many concurrent users "
+            "rather than the data itself."
+        )
+    else:
+        st.info("Memory diagnostics unavailable (psutil not installed in this environment).")
