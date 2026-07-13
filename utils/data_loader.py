@@ -197,6 +197,56 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0):
     return {largest["Vehicle"]: count}, count
 
 
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None):
+    """
+    Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
+    total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
+    cases like "we need 11x 20T trucks but Own doesn't actually own any 20T vehicles" —
+    a pure count-based check (do we have >= 11 vehicles available?) would miss that entirely.
+
+    For each shipment: figures out the smallest truck size that covers it (+ buffer), then
+    tries to assign the smallest AVAILABLE real vehicle of at least that tonnage — Own pool
+    first, then Fixed, then Spot Hire if neither has a suitable vehicle left. Assigned
+    vehicles are removed from the pool so they aren't double-counted for the next shipment.
+
+    Returns a list of per-shipment dicts: {"Load (cases)", "Truck Size Needed", "Source",
+    "Vehicle Number"}.
+    """
+    avail = fleet_status_df[fleet_status_df["Status"] == "Available"].copy()
+    own_pool = avail[avail["OwnershipType"] == "Own"].sort_values("CapacityTonnage").to_dict("records")
+    fixed_pool = avail[avail["OwnershipType"] == "Fixed"].sort_values("CapacityTonnage").to_dict("records")
+    tonnage_lookup = dict(zip(veh_block["Vehicle"], veh_block["TonnageNum"]))
+
+    results = []
+    for load in loads:
+        if load is None or pd.isna(load) or load <= 0:
+            continue
+        plan, _ = allocate_trucks_by_tonnage(load, veh_block, max_tonnage, buffer)
+        for label, n in plan.items():
+            tonnage_needed = tonnage_lookup.get(label, 0)
+            for _ in range(n):
+                assigned_vehicle = None
+                source = None
+                idx = next((i for i, v in enumerate(own_pool) if v["CapacityTonnage"] >= tonnage_needed - 1e-6), None)
+                if idx is not None:
+                    assigned_vehicle = own_pool.pop(idx)
+                    source = "Own"
+                else:
+                    idx = next((i for i, v in enumerate(fixed_pool) if v["CapacityTonnage"] >= tonnage_needed - 1e-6), None)
+                    if idx is not None:
+                        assigned_vehicle = fixed_pool.pop(idx)
+                        source = "Fixed"
+                    else:
+                        source = "Spot Hire"
+                results.append({
+                    "Load (cases)": int(round(load)),
+                    "Truck Size Needed": label,
+                    "Source": source,
+                    "Vehicle Number": assigned_vehicle["Vehicle Number"] if assigned_vehicle else "(market)",
+                })
+    return results
+
+
 # --------------------------------------------------------------------------------------
 # LIVE FLEET TRACKER — process a gate-out log (e.g. from a Google Sheet) into
 # currently-out / available counts, for real intraday spot-hire planning.
