@@ -295,19 +295,26 @@ with st.container(border=True):
             load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
             load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
             match = load_log_df[load_log_df["Date"] == as_of_date]
+            used_date = as_of_date
+
+            if match.empty:
+                past_dates = load_log_df[load_log_df["Date"] <= as_of_date]["Date"].dropna()
+                if not past_dates.empty:
+                    used_date = past_dates.max()
+                    match = load_log_df[load_log_df["Date"] == used_date]
+                    st.info(f"ℹ️ No entry yet for **{as_of_date}** — showing the most recent available date, "
+                            f"**{used_date}**, instead. Add a row for today in your sheet once it's ready.")
+
             if not match.empty:
                 rename_map = {"Total Load (cases)": "Load (cases)"}
                 match = match.rename(columns=rename_map)
                 if "Route / Distributor" not in match.columns:
                     match["Route / Distributor"] = [f"Row {i+1}" for i in range(len(match))]
                 shipments_df = match[["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
-                load_source_note = "Google Sheet"
+                load_source_note = f"Google Sheet ({used_date})"
                 st.dataframe(shipments_df, use_container_width=True, hide_index=True)
             else:
-                available_dates = sorted(load_log_df["Date"].dropna().unique(), reverse=True)[:10]
-                dates_str = ", ".join(str(d) for d in available_dates) if len(available_dates) else "none found at all"
-                st.warning(f"⚠️ No rows found for **{as_of_date}** in the Load Log sheet — enter manually below. "
-                           f"Most recent dates actually in the sheet: {dates_str}")
+                st.warning(f"⚠️ No rows found in the Load Log sheet at all — enter manually below.")
         except Exception as e:
             st.error(f"⚠️ Couldn't read Load Log sheet ({e}).")
     else:
