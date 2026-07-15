@@ -143,8 +143,19 @@ def filter_daily_load_rows(load_log_df, planning_date):
     if "Load (cases)" not in daily_rows.columns:
         raise ValueError("Load Log sheet must contain 'Total Load (cases)' or 'Load (cases)'.")
 
+    if "Dispatch Status" in daily_rows.columns:
+        daily_rows["Dispatch Status"] = (
+            daily_rows["Dispatch Status"]
+            .astype(str)
+            .replace(r'^\s*$', "Pending", regex=True)
+            .replace(r'(?i)^(nan|none)$', "Pending", regex=True)
+            .str.strip()
+            .str.title()
+        )
+        daily_rows = daily_rows[daily_rows["Dispatch Status"] == "Pending"].copy()
+
     daily_rows = daily_rows[pd.to_numeric(daily_rows["Load (cases)"], errors="coerce") > 0]
-    return daily_rows[["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
+    return daily_rows[["Route / Distributor", "Load (cases)" ]].reset_index(drop=True)
 
 
 log_df = None
