@@ -293,28 +293,25 @@ with st.container(border=True):
         try:
             load_log_df = fetch_sheet(load_sheet_url)
             load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
-            load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
-            match = load_log_df[load_log_df["Date"] == as_of_date]
-            used_date = as_of_date
-
-            if match.empty:
-                past_dates = load_log_df[load_log_df["Date"] <= as_of_date]["Date"].dropna()
-                if not past_dates.empty:
-                    used_date = past_dates.max()
-                    match = load_log_df[load_log_df["Date"] == used_date]
-                    st.info(f"ℹ️ No entry yet for **{as_of_date}** — showing the most recent available date, "
-                            f"**{used_date}**, instead. Add a row for today in your sheet once it's ready.")
-
-            if not match.empty:
-                rename_map = {"Total Load (cases)": "Load (cases)"}
-                match = match.rename(columns=rename_map)
-                if "Route / Distributor" not in match.columns:
-                    match["Route / Distributor"] = [f"Row {i+1}" for i in range(len(match))]
-                shipments_df = match[["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
-                load_source_note = f"Google Sheet ({used_date})"
+            
+            # For validation phase: load EVERY row from the sheet, ignore the Date column
+            # Keep only rows where Load (cases) > 0
+            rename_map = {"Total Load (cases)": "Load (cases)"}
+            if "Total Load (cases)" in load_log_df.columns:
+                load_log_df = load_log_df.rename(columns=rename_map)
+            
+            # Ensure Route / Distributor column exists
+            if "Route / Distributor" not in load_log_df.columns:
+                load_log_df["Route / Distributor"] = [f"Row {i+1}" for i in range(len(load_log_df))]
+            
+            # Filter: keep only rows where Load (cases) > 0
+            shipments_df = load_log_df[load_log_df["Load (cases)"] > 0][["Route / Distributor", "Load (cases)"]].reset_index(drop=True)
+            
+            if not shipments_df.empty:
+                load_source_note = "Google Sheet (all rows, entire sheet for validation)"
                 st.dataframe(shipments_df, use_container_width=True, hide_index=True)
             else:
-                st.warning(f"⚠️ No rows found in the Load Log sheet at all — enter manually below.")
+                st.warning(f"⚠️ No rows found with Load (cases) > 0 in the Load Log sheet — enter manually below.")
         except Exception as e:
             st.error(f"⚠️ Couldn't read Load Log sheet ({e}).")
     else:
@@ -333,11 +330,13 @@ with st.container(border=True):
         load_source_note = "manual fallback"
 
     shipment_loads = [x for x in shipments_df["Load (cases)"].tolist() if pd.notna(x) and x > 0] if shipments_df is not None else []
+    shipment_distributors = [x for x in shipments_df["Route / Distributor"].tolist()] if shipments_df is not None else []
     total_load_today = int(sum(shipment_loads))
 
     alloc_results = allocate_shipments_to_fleet(
         shipment_loads, fleet_status_df, edited_veh_block_live,
-        buffer=buffer_cases_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None
+        buffer=buffer_cases_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
+        distributors=shipment_distributors
     )
     alloc_results_df = pd.DataFrame(alloc_results)
 

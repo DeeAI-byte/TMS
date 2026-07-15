@@ -235,7 +235,7 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
     return {largest["Vehicle"]: count}, count
 
 
-def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None):
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None):
     """
     Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
     total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
@@ -247,8 +247,16 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     first, then Fixed, then Spot Hire if neither has a suitable vehicle left. Assigned
     vehicles are removed from the pool so they aren't double-counted for the next shipment.
 
-    Returns a list of per-shipment dicts: {"Load (cases)", "Truck Size Needed", "Source",
-    "Vehicle Number"}.
+    Args:
+        loads: list of case loads (one per shipment)
+        fleet_status_df: available vehicles dataframe
+        veh_block: vehicle size ↔ capacity lookup table
+        buffer: overload buffer in cases
+        max_tonnage: optional tonnage cap
+        distributors: optional list of distributor/route names (one per load) to include in results
+
+    Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load (cases)",
+    "Source", "Distributor"}.
     """
     avail = fleet_status_df[fleet_status_df["Status"] == "Available"].copy()
     own_pool = avail[avail["OwnershipType"] == "Own"].sort_values("CapacityTonnage").to_dict("records")
@@ -256,9 +264,10 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     tonnage_lookup = dict(zip(veh_block["Vehicle"], veh_block["TonnageNum"]))
 
     results = []
-    for load in loads:
+    for i, load in enumerate(loads):
         if load is None or pd.isna(load) or load <= 0:
             continue
+        distributor_label = distributors[i] if distributors and i < len(distributors) else ""
         plan, _ = allocate_trucks_by_tonnage(load, veh_block, max_tonnage, buffer)
         for label, n in plan.items():
             tonnage_needed = tonnage_lookup.get(label, 0)
@@ -277,10 +286,11 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                     else:
                         source = "Spot Hire"
                 results.append({
-                    "Load (cases)": int(round(load)),
-                    "Truck Size Needed": label,
-                    "Source": source,
                     "Vehicle Number": assigned_vehicle["Vehicle Number"] if assigned_vehicle else "(market)",
+                    "Truck Size": label,
+                    "Load (cases)": int(round(load)),
+                    "Source": source,
+                    "Distributor": distributor_label,
                 })
     return results
 
