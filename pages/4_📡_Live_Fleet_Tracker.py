@@ -125,6 +125,8 @@ def fetch_load_sheet(url):
 
 def filter_daily_load_rows(load_log_df, planning_date):
     load_log_df = load_log_df.copy()
+    load_log_df = load_log_df.replace(r'^\s*$', pd.NA, regex=True)
+    load_log_df = load_log_df.dropna(how="all")
     load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
     rename_map = {"Total Load (cases)": "Load (cases)"}
     if "Total Load (cases)" in load_log_df.columns:
@@ -153,6 +155,11 @@ if sheet_url:
         fetch_gate_out_sheet.clear()
     try:
         log_df = fetch_gate_out_sheet(sheet_url)
+        if log_df is not None and not log_df.empty:
+            # Treat rows that are completely blank or whitespace-only as missing data,
+            # so an empty Google Sheet with only headers doesn't produce phantom out vehicles.
+            log_df = log_df.replace(r'^\s*$', pd.NA, regex=True)
+            log_df = log_df.dropna(how="all")
         data_source_label = "🟢 Live — Google Sheet"
     except Exception as e:
         st.error(

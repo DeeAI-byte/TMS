@@ -302,7 +302,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
 def process_gate_out_log(df, as_of_date):
     """
     df must have columns: 'Vehicle Number', 'Ownership', 'Gate Out Date',
-    optionally 'Actual Return Date' and 'Expected Return Date'.
+    optionally 'Actual Return Date' and 'Route / Distributor'.
 
     A vehicle is "currently out" as of as_of_date if its Gate Out Date <= as_of_date
     AND (Actual Return Date is blank OR Actual Return Date > as_of_date).
@@ -314,23 +314,39 @@ def process_gate_out_log(df, as_of_date):
     """
     d = df.copy()
     d.columns = [str(c).strip() for c in d.columns]
+    d = d.replace(r'^\s*$', pd.NA, regex=True)
+
+    if d.empty:
+        return d, d.copy()
+
     d["Vehicle Number"] = d["Vehicle Number"].astype(str).str.strip().str.upper()
     d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
-    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True).dt.date
+    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
     if "Actual Return Date" in d.columns:
-        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True).dt.date
+        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True)
     else:
         d["Actual Return Date"] = pd.NaT
 
-    d = d.dropna(subset=["Gate Out Date"])
-    d["Currently Out"] = d.apply(
-        lambda r: (r["Gate Out Date"] <= as_of_date) and
-                  (pd.isna(r["Actual Return Date"]) or r["Actual Return Date"] > as_of_date),
-        axis=1
+    d = d.dropna(how="all")
+    if d.empty:
+        return d, d.copy()
+
+    as_of_timestamp = pd.to_datetime(as_of_date)
+    d["Currently Out"] = (
+        d["Gate Out Date"].notna() &
+        (d["Gate Out Date"] <= as_of_timestamp) &
+        (
+            d["Actual Return Date"].isna() |
+            (d["Actual Return Date"] > as_of_timestamp)
+        )
     )
-    d["Days Out"] = d.apply(
-        lambda r: (as_of_date - r["Gate Out Date"]).days if r["Currently Out"] else None, axis=1
-    )
+
+    d["Days Out"] = None
+    if d["Currently Out"].any():
+        d.loc[d["Currently Out"], "Days Out"] = (
+            (as_of_timestamp - d.loc[d["Currently Out"], "Gate Out Date"]).dt.days
+        )
+
     currently_out_df = d[d["Currently Out"]].copy()
     return d, currently_out_df
 
