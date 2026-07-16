@@ -204,7 +204,10 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
         eligible = options[options["TonnageNum"] <= max_tonnage + 1e-6]
         if len(eligible) > 0:
             options = eligible
-    options = options.sort_values("TonnageNum")
+    # Stable sort (mergesort) so identical inputs always produce the same truck-size
+    # ordering, even when two sizes share the same TonnageNum — matches the same
+    # determinism guarantee already used for the vehicle pool sort below.
+    options = options.sort_values("TonnageNum", kind="mergesort")
 
     # Step 1: does a single truck (+ buffer) cover it alone?
     for _, row in options.iterrows():
@@ -235,7 +238,7 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
     return {largest["Vehicle"]: count}, count
 
 
-def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None):
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None):
     """
     Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
     total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
@@ -247,18 +250,34 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     first, then Fixed, then Spot Hire if neither has a suitable vehicle left. Assigned
     vehicles are removed from the pool so they aren't double-counted for the next shipment.
 
-    Returns a list of per-shipment dicts: {"Load (cases)", "Truck Size Needed", "Source",
-    "Vehicle Number"}.
+    Args:
+        loads: list of case loads (one per shipment)
+        fleet_status_df: available vehicles dataframe
+        veh_block: vehicle size ↔ capacity lookup table
+        buffer: overload buffer in cases
+        max_tonnage: optional tonnage cap
+        distributors: optional list of distributor/route names (one per load) to include in results
+
+    Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load (cases)",
+    "Source", "Distributor"}.
     """
     avail = fleet_status_df[fleet_status_df["Status"] == "Available"].copy()
-    own_pool = avail[avail["OwnershipType"] == "Own"].sort_values("CapacityTonnage").to_dict("records")
-    fixed_pool = avail[avail["OwnershipType"] == "Fixed"].sort_values("CapacityTonnage").to_dict("records")
+    avail["OwnershipType"] = avail["OwnershipType"].astype(str).str.title()
+    avail["Vehicle Number"] = avail["Vehicle Number"].astype(str).str.strip().str.upper()
+    avail["OwnershipOrder"] = avail["OwnershipType"].map({"Own": 0, "Fixed": 1}).fillna(2)
+    avail = avail.sort_values([
+        "OwnershipOrder", "CapacityTonnage", "Vehicle Number"
+    ], kind="mergesort").drop(columns=["OwnershipOrder"])
+
+    own_pool = avail[avail["OwnershipType"] == "Own"].to_dict("records")
+    fixed_pool = avail[avail["OwnershipType"] == "Fixed"].to_dict("records")
     tonnage_lookup = dict(zip(veh_block["Vehicle"], veh_block["TonnageNum"]))
 
     results = []
-    for load in loads:
+    for i, load in enumerate(loads):
         if load is None or pd.isna(load) or load <= 0:
             continue
+        distributor_label = distributors[i] if distributors and i < len(distributors) else ""
         plan, _ = allocate_trucks_by_tonnage(load, veh_block, max_tonnage, buffer)
         for label, n in plan.items():
             tonnage_needed = tonnage_lookup.get(label, 0)
@@ -277,10 +296,11 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                     else:
                         source = "Spot Hire"
                 results.append({
-                    "Load (cases)": int(round(load)),
-                    "Truck Size Needed": label,
-                    "Source": source,
                     "Vehicle Number": assigned_vehicle["Vehicle Number"] if assigned_vehicle else "(market)",
+                    "Truck Size": label,
+                    "Load (cases)": int(round(load)),
+                    "Source": source,
+                    "Distributor": distributor_label,
                 })
     return results
 
@@ -292,7 +312,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
 def process_gate_out_log(df, as_of_date):
     """
     df must have columns: 'Vehicle Number', 'Ownership', 'Gate Out Date',
-    optionally 'Actual Return Date' and 'Expected Return Date'.
+    optionally 'Actual Return Date' and 'Route / Distributor'.
 
     A vehicle is "currently out" as of as_of_date if its Gate Out Date <= as_of_date
     AND (Actual Return Date is blank OR Actual Return Date > as_of_date).
@@ -304,25 +324,86 @@ def process_gate_out_log(df, as_of_date):
     """
     d = df.copy()
     d.columns = [str(c).strip() for c in d.columns]
+    d = d.replace(r'^\s*$', pd.NA, regex=True)
+
+    if d.empty:
+        return d, d.copy()
+
     d["Vehicle Number"] = d["Vehicle Number"].astype(str).str.strip().str.upper()
     d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
-    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True).dt.date
+    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
     if "Actual Return Date" in d.columns:
-        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True).dt.date
+        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True)
     else:
         d["Actual Return Date"] = pd.NaT
 
-    d = d.dropna(subset=["Gate Out Date"])
-    d["Currently Out"] = d.apply(
-        lambda r: (r["Gate Out Date"] <= as_of_date) and
-                  (pd.isna(r["Actual Return Date"]) or r["Actual Return Date"] > as_of_date),
-        axis=1
+    d = d.dropna(how="all")
+    if d.empty:
+        return d, d.copy()
+
+    as_of_timestamp = pd.to_datetime(as_of_date)
+    d["Currently Out"] = (
+        d["Gate Out Date"].notna() &
+        (d["Gate Out Date"] <= as_of_timestamp) &
+        (
+            d["Actual Return Date"].isna() |
+            (d["Actual Return Date"] > as_of_timestamp)
+        )
     )
-    d["Days Out"] = d.apply(
-        lambda r: (as_of_date - r["Gate Out Date"]).days if r["Currently Out"] else None, axis=1
-    )
+
+    d["Days Out"] = None
+    if d["Currently Out"].any():
+        d.loc[d["Currently Out"], "Days Out"] = (
+            (as_of_timestamp - d.loc[d["Currently Out"], "Gate Out Date"]).dt.days
+        )
+
     currently_out_df = d[d["Currently Out"]].copy()
     return d, currently_out_df
+
+
+def already_dispatched_routes(log_df, as_of_date):
+    """
+    Returns the set of normalized Route/Distributor names that ALREADY have a real
+    gate-out recorded (in the Vehicle/gate-out log) with Gate Out Date == as_of_date.
+
+    Why this exists: the Load Log's own 'Dispatch Status' column is the primary
+    signal that a shipment is done, but it depends on someone remembering to flip
+    it in a SECOND sheet the moment they fill in the gate-out log. If that step
+    lags (or is skipped), the shipment would otherwise still show as 'Pending' and
+    get re-planned against whatever vehicles happen to still be available — handing
+    it a DIFFERENT vehicle than the one that was actually just dispatched for it.
+
+    Cross-checking the gate-out log's own Route/Distributor + Gate Out Date closes
+    that gap using data the Transport Team is already recording, without writing
+    anything back to either sheet. A shipment is treated as executed as soon as
+    EITHER signal (Dispatch Status = Dispatched, OR a matching gate-out entry for
+    today) says so.
+
+    Matching is normalized (strip + casefold) and blank/missing Route/Distributor
+    values are ignored (never treated as a match), so real shipments are never
+    "eaten" by unrelated fleet log entries.
+    """
+    if log_df is None or len(log_df) == 0:
+        return set()
+    d = log_df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    if "Route / Distributor" not in d.columns or "Gate Out Date" not in d.columns:
+        return set()
+
+    d = d.replace(r'^\s*$', pd.NA, regex=True)
+    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
+    as_of_timestamp = pd.to_datetime(as_of_date)
+
+    matched = d[
+        d["Route / Distributor"].notna() &
+        d["Gate Out Date"].notna() &
+        (d["Gate Out Date"].dt.normalize() == as_of_timestamp.normalize())
+    ]
+    routes = (
+        matched["Route / Distributor"]
+        .astype(str).str.strip().str.casefold()
+    )
+    return set(r for r in routes if r)
 
 
 def validate_ownership_values(df):
@@ -350,6 +431,11 @@ def cross_reference_fleet(veh_db, currently_out_df):
     """
     fleet = veh_db.copy()
     fleet["Vehicle Number"] = fleet["Vehicle Number"].astype(str).str.strip().str.upper()
+    fleet["OwnershipType"] = fleet["OwnershipType"].astype(str).str.title()
+    fleet["OwnershipOrder"] = fleet["OwnershipType"].map({"Own": 0, "Fixed": 1}).fillna(2)
+    fleet = fleet.sort_values([
+        "OwnershipOrder", "CapacityTonnage", "Vehicle Number"
+    ], kind="mergesort").drop(columns=["OwnershipOrder"])
 
     out_lookup = {}
     if currently_out_df is not None and not currently_out_df.empty:
