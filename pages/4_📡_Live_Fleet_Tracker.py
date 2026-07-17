@@ -153,9 +153,12 @@ def filter_daily_load_rows(load_log_df, planning_date):
             .str.title()
         )
         daily_rows = daily_rows[daily_rows["Dispatch Status"] == "Pending"].copy()
+        daily_rows = daily_rows.rename(columns={"Dispatch Status": "Status"})
+    else:
+        daily_rows["Status"] = "Pending"
 
     daily_rows = daily_rows[pd.to_numeric(daily_rows["Load (cases)"], errors="coerce") > 0]
-    return daily_rows[["Route / Distributor", "Load (cases)" ]].reset_index(drop=True)
+    return daily_rows[["Route / Distributor", "Load (cases)", "Status"]].reset_index(drop=True)
 
 
 log_df = None
@@ -458,9 +461,11 @@ with c1:
 
 with c2:
     st.subheader("🚫 Vehicles Currently Out")
-    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "Days Out"]
+    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "Distributor", "Days Out"]
                 if c in fleet_status_df.columns]
-    out_show = fleet_status_df[fleet_status_df["Status"] == "Out"][out_cols]
+    out_show = fleet_status_df[fleet_status_df["Status"] == "Out"][out_cols].copy()
+    if "Distributor" in out_show.columns:
+        out_show["Distributor"] = out_show["Distributor"].fillna("—")
     if "Days Out" in out_show.columns:
         out_show = out_show.sort_values("Days Out", ascending=False)
     st.dataframe(out_show, use_container_width=True, height=320, hide_index=True)

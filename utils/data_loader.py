@@ -331,6 +331,8 @@ def process_gate_out_log(df, as_of_date):
 
     d["Vehicle Number"] = d["Vehicle Number"].astype(str).str.strip().str.upper()
     d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
+    if "Route / Distributor" in d.columns:
+        d["Route / Distributor"] = d["Route / Distributor"].astype(str).str.strip()
     d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
     if "Actual Return Date" in d.columns:
         d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True)
@@ -425,7 +427,9 @@ def cross_reference_fleet(veh_db, currently_out_df):
 
     Returns:
       - fleet_status_df: every known vehicle from veh_db with a 'Status' column
-        ('Available' or 'Out') and, if out, 'Days Out'.
+        ('Available' or 'Out'), 'Days Out' if out, and 'Distributor' — the
+        Route/Distributor recorded against that vehicle's gate-out entry, if the
+        log includes that column (blank/None if not out, or not recorded).
       - unmatched_df: rows in the gate-out log whose Vehicle Number isn't in veh_db
         (data-entry mismatches to flag, e.g. typos or vehicles outside the registered fleet).
     """
@@ -438,12 +442,22 @@ def cross_reference_fleet(veh_db, currently_out_df):
     ], kind="mergesort").drop(columns=["OwnershipOrder"])
 
     out_lookup = {}
+    distributor_lookup = {}
+    has_distributor_col = (
+        currently_out_df is not None and not currently_out_df.empty
+        and "Route / Distributor" in currently_out_df.columns
+    )
     if currently_out_df is not None and not currently_out_df.empty:
         for _, r in currently_out_df.iterrows():
             out_lookup[r["Vehicle Number"]] = r.get("Days Out")
+            if has_distributor_col:
+                dist_val = r.get("Route / Distributor")
+                if pd.notna(dist_val) and str(dist_val).strip():
+                    distributor_lookup[r["Vehicle Number"]] = str(dist_val).strip()
 
     fleet["Status"] = fleet["Vehicle Number"].apply(lambda v: "Out" if v in out_lookup else "Available")
     fleet["Days Out"] = fleet["Vehicle Number"].apply(lambda v: out_lookup.get(v))
+    fleet["Distributor"] = fleet["Vehicle Number"].apply(lambda v: distributor_lookup.get(v))
 
     unmatched_df = pd.DataFrame()
     if currently_out_df is not None and not currently_out_df.empty:
