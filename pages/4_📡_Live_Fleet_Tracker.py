@@ -143,17 +143,29 @@ def filter_daily_load_rows(load_log_df, planning_date):
     if "Load (cases)" not in daily_rows.columns:
         raise ValueError("Load Log sheet must contain 'Total Load (cases)' or 'Load (cases)'.")
 
-    if "Dispatch Status" in daily_rows.columns:
-        daily_rows["Dispatch Status"] = (
-            daily_rows["Dispatch Status"]
+    # Find the status column flexibly — sheets in the wild use "Dispatch Status",
+    # "Status", "Dispatched?", extra spacing, different casing, etc. Matching only
+    # the exact literal header "Dispatch Status" silently fails on any of those and
+    # falls back to labeling every row "Pending" regardless of the real cell value.
+    status_col = None
+    for c in daily_rows.columns:
+        key = " ".join(str(c).strip().lower().replace("?", "").split())
+        if key in ("dispatch status", "status", "dispatched status", "delivery status"):
+            status_col = c
+            break
+
+    if status_col is not None:
+        normalized_status = (
+            daily_rows[status_col]
             .astype(str)
             .replace(r'^\s*$', "Pending", regex=True)
             .replace(r'(?i)^(nan|none)$', "Pending", regex=True)
             .str.strip()
             .str.title()
         )
-        daily_rows = daily_rows[daily_rows["Dispatch Status"] == "Pending"].copy()
-        daily_rows = daily_rows.rename(columns={"Dispatch Status": "Status"})
+        if status_col != "Status":
+            daily_rows = daily_rows.drop(columns=[status_col])
+        daily_rows["Status"] = normalized_status
     else:
         daily_rows["Status"] = "Pending"
 
@@ -365,35 +377,42 @@ with st.container(border=True):
         )
         load_source_note = "manual fallback"
 
+    # The table above shows every shipment for today, any status — but only Pending
+    # shipments should ever be planned/allocated a vehicle. Dispatched ones stay visible
+    # for full-picture visibility without being re-recommended a truck.
+    shipments_to_plan_df = shipments_df
+    if shipments_to_plan_df is not None and "Status" in shipments_to_plan_df.columns:
+        shipments_to_plan_df = shipments_to_plan_df[shipments_to_plan_df["Status"] == "Pending"].copy()
+
     # --- Recognize shipments already executed, even if Dispatch Status wasn't flipped ---
-    # filter_daily_load_rows() already drops rows explicitly marked "Dispatched" in the
-    # Load Log. This second check catches the gap where the Transport Team has recorded
-    # the actual gate-out (Vehicle Number + date) in the gate-out log for a distributor,
-    # but hasn't (yet, or ever) updated that shipment's Dispatch Status cell in the
-    # separate Load Log sheet. Without this, that shipment would still look "Pending"
-    # and get re-planned against whatever vehicles are still free — recommending a
-    # DIFFERENT vehicle than the one that was actually just dispatched for it.
+    # shipments_to_plan_df above already excludes anything marked "Dispatched" in the Load
+    # Log. This second check catches the gap where the Transport Team has recorded the
+    # actual gate-out (Vehicle Number + date) in the gate-out log for a distributor, but
+    # hasn't (yet, or ever) updated that shipment's status cell in the separate Load Log
+    # sheet. Without this, that shipment would still look "Pending" and get re-planned
+    # against whatever vehicles are still free — recommending a DIFFERENT vehicle than the
+    # one that was actually just dispatched for it.
     already_dispatched = already_dispatched_routes(log_df, as_of_date) if has_log_data else set()
 
     excluded_rows = pd.DataFrame()
-    if shipments_df is not None and not shipments_df.empty and already_dispatched:
-        norm_route = shipments_df["Route / Distributor"].astype(str).str.strip().str.casefold()
+    if shipments_to_plan_df is not None and not shipments_to_plan_df.empty and already_dispatched:
+        norm_route = shipments_to_plan_df["Route / Distributor"].astype(str).str.strip().str.casefold()
         is_already_out = norm_route.isin(already_dispatched)
-        excluded_rows = shipments_df[is_already_out]
-        shipments_df = shipments_df[~is_already_out].copy()
+        excluded_rows = shipments_to_plan_df[is_already_out]
+        shipments_to_plan_df = shipments_to_plan_df[~is_already_out].copy()
 
     # Deterministic ordering: sort by the shipment's own content (mergesort — stable),
     # not by whatever row order the source sheet happens to have. This guarantees the
     # same set of pending shipments always allocates to the same vehicles, even if
     # someone manually reorders/sorts rows in the Google Sheet without changing the
     # actual data.
-    if shipments_df is not None and not shipments_df.empty:
-        shipments_df = shipments_df.sort_values(
+    if shipments_to_plan_df is not None and not shipments_to_plan_df.empty:
+        shipments_to_plan_df = shipments_to_plan_df.sort_values(
             ["Route / Distributor", "Load (cases)"], kind="mergesort"
         ).reset_index(drop=True)
 
-    shipment_loads = [x for x in shipments_df["Load (cases)"].tolist() if pd.notna(x) and x > 0] if shipments_df is not None else []
-    shipment_distributors = [x for x in shipments_df["Route / Distributor"].tolist()] if shipments_df is not None else []
+    shipment_loads = [x for x in shipments_to_plan_df["Load (cases)"].tolist() if pd.notna(x) and x > 0] if shipments_to_plan_df is not None else []
+    shipment_distributors = [x for x in shipments_to_plan_df["Route / Distributor"].tolist()] if shipments_to_plan_df is not None else []
     total_load_today = int(sum(shipment_loads))
 
     if not excluded_rows.empty:
