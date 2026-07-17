@@ -335,6 +335,51 @@ else:
 
 st.write("---")
 
+# ---------------- LIVE LOAD STATUS SUMMARY ----------------
+# A lightweight, read-only look at today's shipments (any status) — separate from, and
+# purely additive to, the Today's Load box below (which still does its own fetch/manual
+# fallback/planning exactly as before).
+_summary_shipments_df = None
+_summary_fetch_error = None
+if load_sheet_url:
+    try:
+        _summary_shipments_df = filter_daily_load_rows(fetch_load_sheet(load_sheet_url), as_of_date)
+    except Exception as e:
+        _summary_fetch_error = str(e)
+
+st.header(f"📦 Live Load Status — {as_of_date.strftime('%d %b %Y')}")
+if _summary_shipments_df is not None and not _summary_shipments_df.empty:
+    _load_numeric = pd.to_numeric(_summary_shipments_df["Load (cases)"], errors="coerce").fillna(0)
+    _total_orders = len(_summary_shipments_df)
+    _total_load = int(_load_numeric.sum())
+    if "Status" in _summary_shipments_df.columns:
+        _dispatched_mask = _summary_shipments_df["Status"] == "Dispatched"
+    else:
+        _dispatched_mask = pd.Series(False, index=_summary_shipments_df.index)
+    _pending_mask = ~_dispatched_mask
+    _dispatched_orders = int(_dispatched_mask.sum())
+    _dispatched_load = int(_load_numeric[_dispatched_mask].sum())
+    _pending_orders = int(_pending_mask.sum())
+    _pending_load = int(_load_numeric[_pending_mask].sum())
+
+    sl1, sl2, sl3, sl4, sl5, sl6 = st.columns(6)
+    sl1.metric("Total Orders", f"{_total_orders:,}")
+    sl2.metric("Total Load (cases)", f"{_total_load:,}")
+    sl3.metric("✅ Dispatched Orders", f"{_dispatched_orders:,}")
+    sl4.metric("✅ Dispatched Load (cases)", f"{_dispatched_load:,}")
+    sl5.metric("🕒 Pending Orders", f"{_pending_orders:,}")
+    sl6.metric("🕒 Pending Load (cases)", f"{_pending_load:,}")
+elif load_sheet_url:
+    if _summary_fetch_error:
+        st.info(f"⚠️ Couldn't read the Load Log sheet ({_summary_fetch_error}) — see below.")
+    else:
+        st.info(f"No shipments found for {as_of_date.strftime('%d %b %Y')} in the Load Log sheet yet.")
+else:
+    st.info("Connect a Load Log sheet in the sidebar to see a live load summary here — "
+             "or check the manual entry table below.")
+
+st.write("---")
+
 # ---------------- TODAY'S LOAD → TRUCKS → SPOT HIRE ----------------
 with st.container(border=True):
     st.subheader("🚚 Today's Load → Trucks Needed → Spot Hire")
