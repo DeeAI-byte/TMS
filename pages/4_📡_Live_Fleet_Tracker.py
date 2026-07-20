@@ -260,6 +260,45 @@ if not unmatched_df.empty:
     with st.expander("See unmatched entries"):
         st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
 
+with st.expander("🗓️ Look up the gate-out log by date range (e.g. a full month) instead of a single day"):
+    st.caption("This is a separate lookup into the raw log — the 'As of date' above still drives the "
+               "Available/Out status and planning sections below, since those are inherently a "
+               "single-day snapshot.")
+    range_default_start = as_of_date - pd.Timedelta(days=6)
+    picked_range = st.date_input(
+        "Date range", value=(range_default_start, as_of_date), key="live_gate_date_range"
+    )
+    if not has_log_data:
+        st.info("Connect a gate-out log sheet (or add manual entries above) to look up a date range.")
+    elif not (isinstance(picked_range, (list, tuple)) and len(picked_range) == 2):
+        st.info("Pick both a start and an end date to see results.")
+    else:
+        range_start, range_end = picked_range
+        range_df = log_df.copy()
+        range_df.columns = [str(c).strip() for c in range_df.columns]
+        range_df["Gate Out Date"] = pd.to_datetime(range_df["Gate Out Date"], errors="coerce", dayfirst=True)
+        in_range = range_df[
+            range_df["Gate Out Date"].dt.date.between(range_start, range_end)
+        ].copy()
+        st.caption(
+            f"**{len(in_range)}** gate-out entries between **{range_start.strftime('%d %b %Y')}** and "
+            f"**{range_end.strftime('%d %b %Y')}**."
+        )
+        if not in_range.empty:
+            show_cols = [c for c in ["Vehicle Number", "Ownership", "Gate Out Date", "Actual Return Date",
+                                      "Route / Distributor"] if c in in_range.columns]
+            display_range_df = in_range[show_cols].sort_values("Gate Out Date", kind="mergesort")
+            st.dataframe(display_range_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download this range (CSV)",
+                display_range_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"gate_out_log_{range_start}_{range_end}.csv",
+                mime="text/csv",
+                key="download_gate_range"
+            )
+        else:
+            st.info("No gate-out entries fall in that range.")
+
 own_available_df = fleet_status_df[(fleet_status_df["OwnershipType"] == "Own") & (fleet_status_df["Status"] == "Available")]
 fixed_available_df = fleet_status_df[(fleet_status_df["OwnershipType"] == "Fixed") & (fleet_status_df["Status"] == "Available")]
 own_out_df = fleet_status_df[(fleet_status_df["OwnershipType"] == "Own") & (fleet_status_df["Status"] == "Out")]
