@@ -266,8 +266,10 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         max_tonnage: optional tonnage cap (e.g. a distributor's max allowed vehicle size)
         distributors: optional list of distributor/route names (one per load) to include in results
 
-    Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load (cases)",
-    "Source", "Distributor"}.
+    Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load",
+    "Source", "Distributor"}. "Load" is whatever unit was passed in via `loads` (cases,
+    tons, etc.) — this function doesn't care which, it just compares against veh_block's
+    "Capacity" column in the same unit.
     """
     avail = fleet_status_df[fleet_status_df["Status"] == "Available"].copy()
     avail["OwnershipType"] = avail["OwnershipType"].astype(str).str.title()
@@ -297,6 +299,15 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     def take_smallest(pool, tonnage_needed):
         idx = next((i for i, v in enumerate(pool) if v["CapacityTonnage"] >= tonnage_needed - 1e-6), None)
         return pool.pop(idx) if idx is not None else None
+
+    def real_size_label(vehicle):
+        """Display label from the REAL assigned vehicle's own tonnage (e.g. '18T'), not the
+        abstract size class used to search for it — these can differ for multi-truck combos,
+        and showing the vehicle's actual size is what matters once a real vehicle is picked."""
+        t = vehicle.get("CapacityTonnage")
+        if t is None or pd.isna(t):
+            return "?"
+        return f"{t:g}T"
 
     if max_tonnage is not None and pd.notna(max_tonnage):
         fixed_spot_max_tonnage = min(max_tonnage, fixed_spot_cap_tonnage)
@@ -328,8 +339,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                 if v is not None:
                     results.append({
                         "Vehicle Number": v["Vehicle Number"],
-                        "Truck Size": label,
-                        "Load (cases)": int(round(load)),
+                        "Truck Size": real_size_label(v),
+                        "Load": round(float(load), 2),
                         "Source": source_label,
                         "Distributor": distributor_label,
                     })
@@ -346,8 +357,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                     if v is not None:
                         results.append({
                             "Vehicle Number": v["Vehicle Number"],
-                            "Truck Size": label,
-                            "Load (cases)": int(round(load)),
+                            "Truck Size": real_size_label(v),
+                            "Load": round(float(load), 2),
                             "Source": source_label,
                             "Distributor": distributor_label,
                         })
@@ -366,7 +377,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                     results.append({
                         "Vehicle Number": "(market)",
                         "Truck Size": label,
-                        "Load (cases)": int(round(load)),
+                        "Load": round(float(load), 2),
                         "Source": "Spot Hire",
                         "Distributor": distributor_label,
                     })

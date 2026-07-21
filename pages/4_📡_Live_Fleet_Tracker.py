@@ -78,19 +78,19 @@ load_sheet_url = st.sidebar.text_input(
     "Load Log Sheet CSV link",
     value=DEFAULT_LOAD_LOG_SHEET_URL,
     placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-    help="Needs columns: Date, Route / Distributor, Total Load (cases). One row PER SHIPMENT — "
+    help="Needs columns: Date, Route / Distributor, Total Load (Ton). One row PER SHIPMENT — "
          "multiple rows can share the same date. Pre-filled with your default sheet.",
     key="live_load_sheet_url"
 )
 load_refresh = st.sidebar.button("🔄 Refresh Now", use_container_width=True, key="load_refresh_btn")
 with st.sidebar.expander("📋 Load Log sheet columns"):
-    st.markdown("- **Date**\n- **Route / Distributor**\n- **Total Load (cases)**\n\n"
+    st.markdown("- **Date**\n- **Route / Distributor**\n- **Total Load (Ton)**\n\n"
                 "One row per individual shipment, not one lump total per day — real loads are "
-                "different sizes, and each needs matching to the right truck.")
+                "different sizes, and each needs matching to the closest available vehicle tonnage.")
     load_template = pd.DataFrame({
         "Date": [str(date.today())] * 3,
         "Route / Distributor": ["Route A", "Route B", "Route C"],
-        "Total Load (cases)": [600, 250, 3000],
+        "Total Load (Ton)": [6, 2.5, 24],
     })
     st.download_button(
         "⬇️ Download load log template (CSV)",
@@ -100,13 +100,14 @@ with st.sidebar.expander("📋 Load Log sheet columns"):
     )
 
 st.sidebar.write("---")
-st.sidebar.write("**Truck size ↔ Case capacity** (editable)")
+st.sidebar.write("**Truck sizes (tons)** (editable) — the TonnageNum column is what Today's Load "
+                 "matches shipments against; Capacity (cases) is only used elsewhere.")
 edited_veh_block_live = st.sidebar.data_editor(
     veh_block, num_rows="dynamic", use_container_width=True, key="veh_block_live"
 )
-buffer_cases_live = st.sidebar.number_input(
-    "Overload buffer per truck (cases)", min_value=0, value=100, step=10, key="buffer_live",
-    help="Extra cases a truck can carry beyond its rated capacity before a second truck is added."
+buffer_tons_live = st.sidebar.number_input(
+    "Overload buffer per truck (tons)", min_value=0.0, value=1.0, step=0.5, key="buffer_live",
+    help="Extra tons a truck can carry beyond its rated tonnage before a second truck is added."
 )
 max_tonnage_live = st.sidebar.number_input(
     "Max tonnage available today (optional cap)", min_value=0, value=0, step=1, key="max_tonnage_live",
@@ -128,9 +129,18 @@ def filter_daily_load_rows(load_log_df, planning_date):
     load_log_df = load_log_df.replace(r'^\s*$', pd.NA, regex=True)
     load_log_df = load_log_df.dropna(how="all")
     load_log_df.columns = [str(c).strip() for c in load_log_df.columns]
-    rename_map = {"Total Load (cases)": "Load (cases)"}
-    if "Total Load (cases)" in load_log_df.columns:
-        load_log_df = load_log_df.rename(columns=rename_map)
+
+    # Find the load column flexibly — sheets in the wild use "Total Load (Ton)",
+    # "Total Load (Tons)", "Load (Ton)", "Total Load (MT)", different casing/spacing, etc.
+    load_col = None
+    for c in load_log_df.columns:
+        key = " ".join(str(c).strip().lower().replace("(", " ").replace(")", " ").split())
+        if key in ("total load ton", "total load tons", "load ton", "load tons",
+                   "total load mt", "load mt", "total load"):
+            load_col = c
+            break
+    if load_col is not None and load_col != "Load (Ton)":
+        load_log_df = load_log_df.rename(columns={load_col: "Load (Ton)"})
 
     if "Date" not in load_log_df.columns:
         raise ValueError("Load Log sheet must contain a Date column named 'Date'.")
@@ -140,8 +150,8 @@ def filter_daily_load_rows(load_log_df, planning_date):
         load_log_df["Route / Distributor"] = [f"Row {i+1}" for i in range(len(load_log_df))]
 
     daily_rows = load_log_df[load_log_df["Date"] == planning_date].copy()
-    if "Load (cases)" not in daily_rows.columns:
-        raise ValueError("Load Log sheet must contain 'Total Load (cases)' or 'Load (cases)'.")
+    if "Load (Ton)" not in daily_rows.columns:
+        raise ValueError("Load Log sheet must contain a load-in-tons column, e.g. 'Total Load (Ton)'.")
 
     # Find the status column flexibly — sheets in the wild use "Dispatch Status",
     # "Status", "Dispatched?", extra spacing, different casing, etc. Matching only
@@ -169,8 +179,8 @@ def filter_daily_load_rows(load_log_df, planning_date):
     else:
         daily_rows["Status"] = "Pending"
 
-    daily_rows = daily_rows[pd.to_numeric(daily_rows["Load (cases)"], errors="coerce") > 0]
-    return daily_rows[["Route / Distributor", "Load (cases)", "Status"]].reset_index(drop=True)
+    daily_rows = daily_rows[pd.to_numeric(daily_rows["Load (Ton)"], errors="coerce") > 0]
+    return daily_rows[["Route / Distributor", "Load (Ton)", "Status"]].reset_index(drop=True)
 
 
 log_df = None
@@ -388,26 +398,26 @@ if load_sheet_url:
 
 st.header(f"📦 Live Load Status — {as_of_date.strftime('%d %b %Y')}")
 if _summary_shipments_df is not None and not _summary_shipments_df.empty:
-    _load_numeric = pd.to_numeric(_summary_shipments_df["Load (cases)"], errors="coerce").fillna(0)
+    _load_numeric = pd.to_numeric(_summary_shipments_df["Load (Ton)"], errors="coerce").fillna(0)
     _total_orders = len(_summary_shipments_df)
-    _total_load = int(_load_numeric.sum())
+    _total_load = round(float(_load_numeric.sum()), 1)
     if "Status" in _summary_shipments_df.columns:
         _dispatched_mask = _summary_shipments_df["Status"] == "Dispatched"
     else:
         _dispatched_mask = pd.Series(False, index=_summary_shipments_df.index)
     _pending_mask = ~_dispatched_mask
     _dispatched_orders = int(_dispatched_mask.sum())
-    _dispatched_load = int(_load_numeric[_dispatched_mask].sum())
+    _dispatched_load = round(float(_load_numeric[_dispatched_mask].sum()), 1)
     _pending_orders = int(_pending_mask.sum())
-    _pending_load = int(_load_numeric[_pending_mask].sum())
+    _pending_load = round(float(_load_numeric[_pending_mask].sum()), 1)
 
     sl1, sl2, sl3, sl4, sl5, sl6 = st.columns(6)
     sl1.metric("Total Orders", f"{_total_orders:,}")
-    sl2.metric("Total Load (cases)", f"{_total_load:,}")
+    sl2.metric("Total Load (Ton)", f"{_total_load:,}")
     sl3.metric("✅ Dispatched Orders", f"{_dispatched_orders:,}")
-    sl4.metric("✅ Dispatched Load (cases)", f"{_dispatched_load:,}")
+    sl4.metric("✅ Dispatched Load (Ton)", f"{_dispatched_load:,}")
     sl5.metric("🕒 Pending Orders", f"{_pending_orders:,}")
-    sl6.metric("🕒 Pending Load (cases)", f"{_pending_load:,}")
+    sl6.metric("🕒 Pending Load (Ton)", f"{_pending_load:,}")
 elif load_sheet_url:
     if _summary_fetch_error:
         st.info(f"⚠️ Couldn't read the Load Log sheet ({_summary_fetch_error}) — see below.")
@@ -422,9 +432,9 @@ st.write("---")
 # ---------------- TODAY'S LOAD → TRUCKS → SPOT HIRE ----------------
 with st.container(border=True):
     st.subheader("🚚 Today's Load → Trucks Needed → Spot Hire")
-    st.caption("Enter each distributor/route's load separately — real dispatch is many different-sized "
-               "shipments, not one lump total, and each needs its own appropriately-sized truck matched "
-               "against what you actually have available (not just a total capacity assumption).")
+    st.caption("Enter each distributor/route's load separately, in TONS — real dispatch is many "
+               "different-sized shipments, not one lump total, and each is matched to the closest "
+               "available vehicle tonnage (not just a total capacity assumption).")
 
     shipments_df = None
     load_source_note = ""
@@ -452,12 +462,12 @@ with st.container(border=True):
     if shipments_df is None:
         if "fallback_shipments_df" not in st.session_state:
             st.session_state.fallback_shipments_df = pd.DataFrame({
-                "Route / Distributor": [""], "Load (cases)": [0]
+                "Route / Distributor": [""], "Load (Ton)": [0.0]
             })
         shipments_df = st.data_editor(
             st.session_state.fallback_shipments_df, num_rows="dynamic", use_container_width=True,
             key="fallback_shipments_editor",
-            column_config={"Load (cases)": st.column_config.NumberColumn(min_value=0, step=100)}
+            column_config={"Load (Ton)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")}
         )
         load_source_note = "manual fallback"
 
@@ -492,12 +502,12 @@ with st.container(border=True):
     # actual data.
     if shipments_to_plan_df is not None and not shipments_to_plan_df.empty:
         shipments_to_plan_df = shipments_to_plan_df.sort_values(
-            ["Route / Distributor", "Load (cases)"], kind="mergesort"
+            ["Route / Distributor", "Load (Ton)"], kind="mergesort"
         ).reset_index(drop=True)
 
-    shipment_loads = [x for x in shipments_to_plan_df["Load (cases)"].tolist() if pd.notna(x) and x > 0] if shipments_to_plan_df is not None else []
+    shipment_loads = [x for x in shipments_to_plan_df["Load (Ton)"].tolist() if pd.notna(x) and x > 0] if shipments_to_plan_df is not None else []
     shipment_distributors = [x for x in shipments_to_plan_df["Route / Distributor"].tolist()] if shipments_to_plan_df is not None else []
-    total_load_today = int(sum(shipment_loads))
+    total_load_today = round(float(sum(shipment_loads)), 1)
 
     if not excluded_rows.empty:
         st.caption(
@@ -506,20 +516,28 @@ with st.container(border=True):
             f"{', '.join(sorted(set(excluded_rows['Route / Distributor'].astype(str))))}."
         )
 
+    # Today's Load is now measured directly in tons — match each shipment to the closest
+    # available vehicle TONNAGE (Own's full range, then Fixed/Spot Hire capped at their
+    # real max size) rather than converting through a cases-per-truck capacity table.
+    veh_block_tons = edited_veh_block_live[["Vehicle", "TonnageNum"]].copy()
+    veh_block_tons["TonnageNum"] = pd.to_numeric(veh_block_tons["TonnageNum"], errors="coerce")
+    veh_block_tons = veh_block_tons.dropna(subset=["TonnageNum"])
+    veh_block_tons["Capacity"] = veh_block_tons["TonnageNum"]
+
     alloc_results = allocate_shipments_to_fleet(
-        shipment_loads, fleet_status_df, edited_veh_block_live,
-        buffer=buffer_cases_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
+        shipment_loads, fleet_status_df, veh_block_tons,
+        buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
         distributors=shipment_distributors
     )
     alloc_results_df = pd.DataFrame(alloc_results)
 
     if not alloc_results_df.empty:
-        alloc_results_df["Load"] = alloc_results_df["Load (cases)"]
+        alloc_results_df = alloc_results_df.rename(columns={"Load": "Load (Ton)"})
         alloc_results_df["Gate Out Date"] = np.where(
             alloc_results_df["Source"].isin(["Own", "Fixed"]), as_of_date, ""
         )
         alloc_results_df = alloc_results_df[
-            ["Vehicle Number", "Truck Size", "Load", "Source", "Distributor",
+            ["Vehicle Number", "Truck Size", "Load (Ton)", "Source", "Distributor",
              "Gate Out Date"]
         ]
 
@@ -529,7 +547,7 @@ with st.container(border=True):
     spot_needed_today = int((alloc_results_df["Source"] == "Spot Hire").sum()) if not alloc_results_df.empty else 0
 
     st.caption(f"Load source: **{load_source_note}** · {len(shipment_loads)} shipments totaling "
-               f"{total_load_today:,} cases (with a {buffer_cases_live}-case/truck buffer) → "
+               f"{total_load_today:,} tons (with a {buffer_tons_live}-ton/truck buffer) → "
                f"**{trucks_needed_today:,} trucks needed today**, matched against your real available fleet.")
 
     d1, d2, d3, d4 = st.columns(4)
@@ -581,12 +599,13 @@ with st.expander("ℹ️ How this works"):
        every truck is tracked individually — not just as an aggregate count. Unrecognized vehicle
        numbers (typos, unregistered trucks) are flagged separately.
     3. **Available = registered fleet − currently out**, giving real intraday status.
-    4. For **Today's Load**, enter each shipment separately (route/distributor + cases) rather than one
+    4. For **Today's Load**, enter each shipment separately (route/distributor + tons) rather than one
        lump total — real dispatch is many different-sized loads, not one uniform number. Each shipment
-       is matched to the smallest truck size that covers it (+ your overload buffer), then assigned to
-       the smallest AVAILABLE real vehicle of at least that size — Own first, then Fixed, then Spot Hire
-       — checked **vehicle by vehicle against actual tonnage on hand**, not just a headcount. This catches
-       cases a simple count could miss, like needing 20T trucks that Own doesn't actually own any of.
+       is matched to the closest AVAILABLE real vehicle tonnage that still covers it (+ your overload
+       buffer) — Own first (including any size only Own has), then Fixed, then Spot Hire — checked
+       **vehicle by vehicle against actual tonnage on hand**, not just a headcount. Fixed and Spot Hire
+       are capped at whatever the largest real Fixed vehicle in your fleet actually is, so neither is
+       ever offered a size they don't physically have.
 
     **Publishing a Google Sheet as CSV:** open the sheet → File → Share → Publish to web → choose the
     correct tab → format **Comma-separated values (.csv)** → Publish → copy the link into the sidebar.
