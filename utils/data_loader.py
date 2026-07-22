@@ -238,7 +238,7 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
     return {largest["Vehicle"]: count}, count
 
 
-def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None):
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None, max_tonnages=None):
     """
     Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
     total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
@@ -258,13 +258,22 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
          (the market doesn't deal in a size your own Fixed fleet doesn't have either), but
          unlimited supply, so it always finishes covering the shipment.
 
+    Every tier additionally respects that shipment's own max tonnage cap — the smaller of
+    the global `max_tonnage` (if any) and that shipment's entry in `max_tonnages` (if any,
+    e.g. a distributor's max allowed vehicle size due to road/gate access). A distributor
+    capped at 4T will only ever be offered 4T (or smaller) trucks, however many it takes —
+    never a bigger truck just because one happens to be free.
+
     Args:
-        loads: list of case loads (one per shipment)
+        loads: list of case/ton loads (one per shipment)
         fleet_status_df: available vehicles dataframe
         veh_block: vehicle size ↔ capacity lookup table (Own's full range)
-        buffer: overload buffer in cases
-        max_tonnage: optional tonnage cap (e.g. a distributor's max allowed vehicle size)
+        buffer: overload buffer
+        max_tonnage: optional global tonnage cap applied to every shipment
         distributors: optional list of distributor/route names (one per load) to include in results
+        max_tonnages: optional list, same length as loads — a per-shipment tonnage cap
+            (e.g. that distributor's max allowed vehicle size). None entries mean "no
+            distributor-specific cap for this shipment".
 
     Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load",
     "Source", "Distributor"}. "Load" is whatever unit was passed in via `loads` (cases,
@@ -296,8 +305,10 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     tonnage_lookup = dict(zip(veh_block["Vehicle"], veh_block["TonnageNum"]))
     capacity_lookup = dict(zip(veh_block["Vehicle"], veh_block["Capacity"]))
 
-    def take_smallest(pool, tonnage_needed):
-        idx = next((i for i, v in enumerate(pool) if v["CapacityTonnage"] >= tonnage_needed - 1e-6), None)
+    def take_smallest(pool, tonnage_needed, max_allowed=None):
+        idx = next((i for i, v in enumerate(pool)
+                    if v["CapacityTonnage"] >= tonnage_needed - 1e-6
+                    and (max_allowed is None or v["CapacityTonnage"] <= max_allowed + 1e-6)), None)
         return pool.pop(idx) if idx is not None else None
 
     def real_size_label(vehicle):
@@ -309,16 +320,27 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             return "?"
         return f"{t:g}T"
 
-    if max_tonnage is not None and pd.notna(max_tonnage):
-        fixed_spot_max_tonnage = min(max_tonnage, fixed_spot_cap_tonnage)
-    else:
-        fixed_spot_max_tonnage = fixed_spot_cap_tonnage
-
     results = []
     for i, load in enumerate(loads):
         if load is None or pd.isna(load) or load <= 0:
             continue
         distributor_label = distributors[i] if distributors and i < len(distributors) else ""
+
+        # Effective cap for THIS shipment = the tighter of the global cap and this
+        # shipment's own cap (e.g. a distributor's max allowed vehicle tonnage — road
+        # width, gate access, etc.). A distributor capped at 4T only ever gets 4T-or-
+        # smaller trucks, however many it takes — never a bigger one just because it's
+        # free.
+        shipment_cap = max_tonnage if (max_tonnage is not None and pd.notna(max_tonnage)) else None
+        if max_tonnages is not None and i < len(max_tonnages):
+            dist_cap = max_tonnages[i]
+            if dist_cap is not None and pd.notna(dist_cap):
+                shipment_cap = dist_cap if shipment_cap is None else min(shipment_cap, dist_cap)
+
+        if shipment_cap is not None:
+            shipment_fixed_spot_cap = min(shipment_cap, fixed_spot_cap_tonnage)
+        else:
+            shipment_fixed_spot_cap = fixed_spot_cap_tonnage
 
         def assign_from_tier(remaining_load, tier_veh_block, pool, source_label, tier_max_tonnage):
             """Covers as much of remaining_load as this tier's real vehicle pool allows,
@@ -335,7 +357,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                 # that size is available, the whole thing is covered, full stop.
                 label = next(iter(plan))
                 tonnage_needed = tonnage_lookup.get(label, 0)
-                v = take_smallest(pool, tonnage_needed)
+                v = take_smallest(pool, tonnage_needed, tier_max_tonnage)
                 if v is not None:
                     results.append({
                         "Vehicle Number": v["Vehicle Number"],
@@ -353,7 +375,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             for label, n in sorted(plan.items(), key=lambda kv: tonnage_lookup.get(kv[0], 0)):
                 tonnage_needed = tonnage_lookup.get(label, 0)
                 for _ in range(n):
-                    v = take_smallest(pool, tonnage_needed)
+                    v = take_smallest(pool, tonnage_needed, tier_max_tonnage)
                     if v is not None:
                         results.append({
                             "Vehicle Number": v["Vehicle Number"],
@@ -366,12 +388,13 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             return max(0.0, remaining_load - covered)
 
         remaining = float(load)
-        remaining = assign_from_tier(remaining, veh_block, own_pool, "Own", max_tonnage)
-        remaining = assign_from_tier(remaining, capped_veh_block, fixed_pool, "Fixed", fixed_spot_max_tonnage)
+        remaining = assign_from_tier(remaining, veh_block, own_pool, "Own", shipment_cap)
+        remaining = assign_from_tier(remaining, capped_veh_block, fixed_pool, "Fixed", shipment_fixed_spot_cap)
 
         if remaining > 1e-6:
-            # Spot Hire — same size ceiling as Fixed, unlimited supply, always finishes the job.
-            plan, _ = allocate_trucks_by_tonnage(remaining, capped_veh_block, fixed_spot_max_tonnage, buffer)
+            # Spot Hire — same size ceiling as Fixed (further capped to this shipment's own
+            # limit), unlimited supply, always finishes the job.
+            plan, _ = allocate_trucks_by_tonnage(remaining, capped_veh_block, shipment_fixed_spot_cap, buffer)
             for label, n in sorted(plan.items(), key=lambda kv: tonnage_lookup.get(kv[0], 0)):
                 for _ in range(n):
                     results.append({

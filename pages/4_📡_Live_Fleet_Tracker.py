@@ -11,7 +11,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.data_loader import (
     load_vehicle_database, fleet_totals_by_ownership, load_assumptions,
     process_gate_out_log, cross_reference_fleet, validate_ownership_values,
-    allocate_trucks_by_tonnage, allocate_shipments_to_fleet, already_dispatched_routes
+    allocate_trucks_by_tonnage, allocate_shipments_to_fleet, already_dispatched_routes,
+    load_db_capacity
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -504,10 +505,31 @@ with st.container(border=True):
         shipments_to_plan_df = shipments_to_plan_df.sort_values(
             ["Route / Distributor", "Load (Ton)"], kind="mergesort"
         ).reset_index(drop=True)
+        # Keep loads/distributors/caps all aligned by filtering once, here, rather than
+        # filtering shipment_loads separately below (which previously could desync the
+        # two lists if a row had a blank/zero load).
+        shipments_to_plan_df = shipments_to_plan_df[
+            pd.to_numeric(shipments_to_plan_df["Load (Ton)"], errors="coerce") > 0
+        ].reset_index(drop=True)
 
-    shipment_loads = [x for x in shipments_to_plan_df["Load (Ton)"].tolist() if pd.notna(x) and x > 0] if shipments_to_plan_df is not None else []
-    shipment_distributors = [x for x in shipments_to_plan_df["Route / Distributor"].tolist()] if shipments_to_plan_df is not None else []
+    shipment_loads = shipments_to_plan_df["Load (Ton)"].tolist() if shipments_to_plan_df is not None and not shipments_to_plan_df.empty else []
+    shipment_distributors = shipments_to_plan_df["Route / Distributor"].tolist() if shipments_to_plan_df is not None and not shipments_to_plan_df.empty else []
     total_load_today = round(float(sum(shipment_loads)), 1)
+
+    # Each distributor can only physically receive up to its own max allowed vehicle size
+    # (road width, gate access, etc.) — from the Distributor-wise Max Vehicle Capacity
+    # sheet. A 52-ton order for a distributor capped at 4T should become several 4T (or
+    # smaller) trucks, never a single bigger one just because it's free.
+    db_capacity_live = load_db_capacity()
+    _dist_cap_lookup = {}
+    for _, r in db_capacity_live.iterrows():
+        name = str(r.get("Distributor", "")).strip().casefold()
+        cap = r.get("MaxVehicleTonnage")
+        if name and pd.notna(cap):
+            _dist_cap_lookup[name] = float(cap)
+    shipment_max_tonnages = [
+        _dist_cap_lookup.get(str(d).strip().casefold()) for d in shipment_distributors
+    ]
 
     if not excluded_rows.empty:
         st.caption(
@@ -515,6 +537,13 @@ with st.container(border=True):
             f"for that distributor — excluded from re-planning: "
             f"{', '.join(sorted(set(excluded_rows['Route / Distributor'].astype(str))))}."
         )
+
+    capped_shipments = [
+        (dist, cap) for dist, cap in zip(shipment_distributors, shipment_max_tonnages) if cap is not None
+    ]
+    if capped_shipments:
+        cap_notes = ", ".join(f"{dist} (max {cap:g}T)" for dist, cap in sorted(set(capped_shipments)))
+        st.caption(f"🚧 Distributor max-vehicle limits applied: {cap_notes}.")
 
     # Today's Load is now measured directly in tons — match each shipment to the closest
     # available vehicle TONNAGE (Own's full range, then Fixed/Spot Hire capped at their
@@ -527,7 +556,7 @@ with st.container(border=True):
     alloc_results = allocate_shipments_to_fleet(
         shipment_loads, fleet_status_df, veh_block_tons,
         buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
-        distributors=shipment_distributors
+        distributors=shipment_distributors, max_tonnages=shipment_max_tonnages
     )
     alloc_results_df = pd.DataFrame(alloc_results)
 
