@@ -303,13 +303,6 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         capped_veh_block = veh_block.copy()
 
     tonnage_lookup = dict(zip(veh_block["Vehicle"], veh_block["TonnageNum"]))
-    capacity_lookup = dict(zip(veh_block["Vehicle"], veh_block["Capacity"]))
-
-    def take_smallest(pool, tonnage_needed, max_allowed=None):
-        idx = next((i for i, v in enumerate(pool)
-                    if v["CapacityTonnage"] >= tonnage_needed - 1e-6
-                    and (max_allowed is None or v["CapacityTonnage"] <= max_allowed + 1e-6)), None)
-        return pool.pop(idx) if idx is not None else None
 
     def real_size_label(vehicle):
         """Display label from the REAL assigned vehicle's own tonnage (e.g. '18T'), not the
@@ -342,58 +335,66 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         else:
             shipment_fixed_spot_cap = fixed_spot_cap_tonnage
 
-        def assign_from_tier(remaining_load, tier_veh_block, pool, source_label, tier_max_tonnage):
-            """Covers as much of remaining_load as this tier's real vehicle pool allows,
-            appending assignments to results. Returns cases still uncovered by this tier."""
+        def assign_from_real_pool(remaining_load, pool, source_label, tier_max_tonnage):
+            """Covers as much of remaining_load as this tier's REAL vehicle pool allows —
+            matches directly against actual vehicle tonnages on hand (e.g. a real 6T, 6.5T
+            or 7T vehicle can serve a 6-ton load) rather than quantizing the load to the
+            nearest abstract size bucket first and then only searching for vehicles at or
+            above THAT bucket's threshold, which silently skips perfectly adequate real
+            vehicles sitting between buckets. Appends assignments to results; returns
+            whatever's still uncovered by this tier."""
             if remaining_load <= 1e-6:
                 return 0.0
-            plan, total_trucks = allocate_trucks_by_tonnage(remaining_load, tier_veh_block, tier_max_tonnage, buffer)
-            if not plan:
-                return remaining_load
 
-            if total_trucks == 1:
-                # allocate_trucks_by_tonnage already confirmed (buffer included) that ONE
-                # truck of this size fully covers remaining_load — if a real vehicle of
-                # that size is available, the whole thing is covered, full stop.
-                label = next(iter(plan))
-                tonnage_needed = tonnage_lookup.get(label, 0)
-                v = take_smallest(pool, tonnage_needed, tier_max_tonnage)
-                if v is not None:
-                    results.append({
-                        "Vehicle Number": v["Vehicle Number"],
-                        "Truck Size": real_size_label(v),
-                        "Load": round(float(load), 2),
-                        "Source": source_label,
-                        "Distributor": distributor_label,
-                    })
-                    return 0.0
-                return remaining_load
+            def eligible_idxs():
+                return [i for i, v in enumerate(pool)
+                        if tier_max_tonnage is None or v["CapacityTonnage"] <= tier_max_tonnage + 1e-6]
 
-            # Multi-truck plan (larger loads): credit each successfully-assigned truck's
-            # base capacity, leftover (if the pool ran short) rolls to the next tier.
-            covered = 0.0
-            for label, n in sorted(plan.items(), key=lambda kv: tonnage_lookup.get(kv[0], 0)):
-                tonnage_needed = tonnage_lookup.get(label, 0)
-                for _ in range(n):
-                    v = take_smallest(pool, tonnage_needed, tier_max_tonnage)
-                    if v is not None:
-                        results.append({
-                            "Vehicle Number": v["Vehicle Number"],
-                            "Truck Size": real_size_label(v),
-                            "Load": round(float(load), 2),
-                            "Source": source_label,
-                            "Distributor": distributor_label,
-                        })
-                        covered += float(capacity_lookup.get(label, 0))
-            return max(0.0, remaining_load - covered)
+            # Try ONE real vehicle first — the smallest eligible one whose own tonnage
+            # (+ buffer) fully covers the whole remaining load. This is the "closest
+            # tonnage vehicle available" match for the common single-truck shipment.
+            idxs = eligible_idxs()
+            idx = next((i for i in idxs if pool[i]["CapacityTonnage"] + buffer >= remaining_load - 1e-6), None)
+            if idx is not None:
+                v = pool.pop(idx)
+                results.append({
+                    "Vehicle Number": v["Vehicle Number"],
+                    "Truck Size": real_size_label(v),
+                    "Load": round(float(load), 2),
+                    "Source": source_label,
+                    "Distributor": distributor_label,
+                })
+                return 0.0
+
+            # No single eligible vehicle suffices (load bigger than any one available
+            # truck, even with buffer) — greedily take the LARGEST eligible vehicles
+            # first (fewest trucks used), repeatedly, until covered or this tier's real
+            # pool (within the cap) runs out. Whatever's left rolls to the next tier.
+            remaining = remaining_load
+            while remaining > 1e-6:
+                idxs = eligible_idxs()
+                if not idxs:
+                    break
+                idx = max(idxs, key=lambda i: pool[i]["CapacityTonnage"])
+                v = pool.pop(idx)
+                results.append({
+                    "Vehicle Number": v["Vehicle Number"],
+                    "Truck Size": real_size_label(v),
+                    "Load": round(float(load), 2),
+                    "Source": source_label,
+                    "Distributor": distributor_label,
+                })
+                remaining -= (v["CapacityTonnage"] + buffer)
+            return max(0.0, remaining)
 
         remaining = float(load)
-        remaining = assign_from_tier(remaining, veh_block, own_pool, "Own", shipment_cap)
-        remaining = assign_from_tier(remaining, capped_veh_block, fixed_pool, "Fixed", shipment_fixed_spot_cap)
+        remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap)
+        remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap)
 
         if remaining > 1e-6:
-            # Spot Hire — same size ceiling as Fixed (further capped to this shipment's own
-            # limit), unlimited supply, always finishes the job.
+            # Spot Hire — no real fleet to check against, so it falls back to the standard
+            # size classes (veh_block), same size ceiling as Fixed (further capped to this
+            # shipment's own limit). Unlimited supply, always finishes the job.
             plan, _ = allocate_trucks_by_tonnage(remaining, capped_veh_block, shipment_fixed_spot_cap, buffer)
             for label, n in sorted(plan.items(), key=lambda kv: tonnage_lookup.get(kv[0], 0)):
                 for _ in range(n):
