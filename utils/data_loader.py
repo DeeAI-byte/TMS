@@ -523,23 +523,25 @@ def validate_ownership_values(df):
     return [v for v in vals if v not in ("Own", "Fixed")]
 
 
-_NON_OPERATIONAL_KEYWORDS = [
-    "non operational", "non-operational", "not operational", "maintenance", "repair",
-    "scrap", "sold", "inactive", "off road", "off-road", "breakdown", "accident",
-    "grounded", "condemn", "vor", "out of service", "under repair", "damaged",
-]
+def _operational_mask(remarks_series, remarks_col_present):
+    """True = operational.
 
+    Strict whitelist per business rule: a vehicle is only usable for gate-out matching /
+    availability if its Remarks explicitly says "operational" (case/whitespace-insensitive).
+    Anything else — blank, "Vehicle Breakdown", "Driver not avaialble", or any other note —
+    is excluded. Guards against "non operational"/"not operational" accidentally matching
+    via the plain "operational" substring.
 
-def _operational_mask(remarks_series):
-    """True = operational. Blank/missing Remarks default to operational (so vehicles
-    added before this column existed aren't accidentally excluded); a Remarks value is
-    only treated as non-operational if it contains one of the known "not roadworthy"
-    keywords (maintenance, repair, scrap, sold, breakdown, etc.) — anything else (e.g.
-    "Operational", "OK", "Good condition") stays operational."""
+    If the Vehicle Database has NO Remarks column at all (older sheets, before this was
+    tracked), every vehicle is treated as operational — that's a structural absence of the
+    column, not a real "not operational" signal, so it shouldn't exclude anyone.
+    """
+    if not remarks_col_present:
+        return pd.Series(True, index=remarks_series.index)
     normalized = remarks_series.astype(str).str.strip().str.lower()
-    is_blank = normalized.isin(["", "nan", "none"])
-    contains_bad = normalized.apply(lambda s: any(k in s for k in _NON_OPERATIONAL_KEYWORDS))
-    return is_blank | ~contains_bad
+    is_negated = normalized.str.contains(r'(?:non|not)[\s-]*operational', regex=True, na=False)
+    says_operational = normalized.str.contains(r'operational', regex=True, na=False)
+    return says_operational & ~is_negated
 
 
 def cross_reference_fleet(veh_db, currently_out_df):
@@ -547,11 +549,11 @@ def cross_reference_fleet(veh_db, currently_out_df):
     Matches the gate-out log's Vehicle Number against the actual Vehicle Database so the
     Live Tracker works at individual-vehicle granularity (not just aggregate counts).
 
-    Only OPERATIONAL vehicles are considered — a vehicle whose Remarks column flags it as
-    under maintenance, scrapped, sold, etc. is excluded entirely from both Available and
-    Out (it's not a real dispatch candidate). If the Vehicle Database has no Remarks
-    column at all, every vehicle is treated as operational (unchanged, backward-compatible
-    behavior).
+    Only OPERATIONAL vehicles are considered — per business rule, a vehicle must have
+    Remarks explicitly saying "operational" to be a real dispatch candidate; anything else
+    (blank, under maintenance, driver unavailable, breakdown, etc.) is excluded entirely
+    from both Available and Out. If the Vehicle Database has no Remarks column at all,
+    every vehicle is treated as operational (unchanged, backward-compatible behavior).
 
     Returns:
       - fleet_status_df: every known OPERATIONAL vehicle from veh_db with a 'Status'
@@ -561,18 +563,19 @@ def cross_reference_fleet(veh_db, currently_out_df):
       - unmatched_df: gate-out log rows that couldn't be matched to an operational
         vehicle, with a 'Reason' column distinguishing "Vehicle Number not found in
         Vehicle Database" (likely a typo) from "Vehicle marked non-operational in
-        Vehicle Database" (someone logged a gate-out for a vehicle that's flagged as
-        not roadworthy — worth a second look).
+        Vehicle Database" (someone logged a gate-out for a vehicle that isn't flagged
+        as operational — worth a second look).
     """
     fleet = veh_db.copy()
     fleet["Vehicle Number"] = fleet["Vehicle Number"].astype(str).str.strip().str.upper()
     fleet["OwnershipType"] = fleet["OwnershipType"].astype(str).str.title()
 
-    if "Remarks" in fleet.columns:
+    remarks_col_present = "Remarks" in fleet.columns
+    if remarks_col_present:
         fleet["Remarks"] = fleet["Remarks"].astype(str).str.strip().replace({"nan": "", "None": ""})
     else:
         fleet["Remarks"] = ""
-    is_operational = _operational_mask(fleet["Remarks"])
+    is_operational = _operational_mask(fleet["Remarks"], remarks_col_present)
     non_operational_fleet = fleet[~is_operational].copy()
     fleet = fleet[is_operational].copy()
 
