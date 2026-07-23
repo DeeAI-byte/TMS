@@ -188,7 +188,15 @@ def filter_daily_load_rows(load_log_df, planning_date):
     else:
         daily_rows["Status"] = "Pending"
 
-    daily_rows = daily_rows[pd.to_numeric(daily_rows["Load (Ton)"], errors="coerce") > 0]
+    # Extract the numeric portion regardless of a trailing unit — sheets in the wild write
+    # "4T", "3.3T", "4 Ton", plain "4", etc. A straight pd.to_numeric() chokes on any of the
+    # unit-suffixed forms and silently turns the whole column to NaN, which then filters out
+    # EVERY row here even though the sheet clearly has valid loads for today.
+    daily_rows["Load (Ton)"] = pd.to_numeric(
+        daily_rows["Load (Ton)"].astype(str).str.extract(r'([\d]*\.?[\d]+)')[0],
+        errors="coerce"
+    )
+    daily_rows = daily_rows[daily_rows["Load (Ton)"] > 0]
     return daily_rows[["Route / Distributor", "Load (Ton)", "Status"]].reset_index(drop=True)
 
 
@@ -489,6 +497,19 @@ with st.container(border=True):
                                 st.warning(f"{unparsed} row(s) had a Date value that couldn't be parsed.")
                         else:
                             st.error("No 'Date' column found at all in this sheet — check the header spelling.")
+
+                        load_col_guess = next((c for c in raw_preview.columns
+                                                if "load" in c.strip().lower()), None)
+                        if load_col_guess:
+                            parsed_loads = pd.to_numeric(
+                                raw_preview[load_col_guess].astype(str).str.extract(r'([\d]*\.?[\d]+)')[0],
+                                errors="coerce"
+                            )
+                            bad_loads = int(parsed_loads.isna().sum())
+                            if bad_loads:
+                                st.warning(f"{bad_loads} row(s) had a '{load_col_guess}' value with no parseable "
+                                           f"number in it at all (checked separately from any unit text like 'T').")
+
                         st.dataframe(raw_preview.head(10), use_container_width=True, hide_index=True)
                         st.caption(
                             "💡 If the data above looks correct but this is still empty, Google Sheets' own "
