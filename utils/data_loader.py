@@ -523,22 +523,59 @@ def validate_ownership_values(df):
     return [v for v in vals if v not in ("Own", "Fixed")]
 
 
+_NON_OPERATIONAL_KEYWORDS = [
+    "non operational", "non-operational", "not operational", "maintenance", "repair",
+    "scrap", "sold", "inactive", "off road", "off-road", "breakdown", "accident",
+    "grounded", "condemn", "vor", "out of service", "under repair", "damaged",
+]
+
+
+def _operational_mask(remarks_series):
+    """True = operational. Blank/missing Remarks default to operational (so vehicles
+    added before this column existed aren't accidentally excluded); a Remarks value is
+    only treated as non-operational if it contains one of the known "not roadworthy"
+    keywords (maintenance, repair, scrap, sold, breakdown, etc.) — anything else (e.g.
+    "Operational", "OK", "Good condition") stays operational."""
+    normalized = remarks_series.astype(str).str.strip().str.lower()
+    is_blank = normalized.isin(["", "nan", "none"])
+    contains_bad = normalized.apply(lambda s: any(k in s for k in _NON_OPERATIONAL_KEYWORDS))
+    return is_blank | ~contains_bad
+
+
 def cross_reference_fleet(veh_db, currently_out_df):
     """
     Matches the gate-out log's Vehicle Number against the actual Vehicle Database so the
     Live Tracker works at individual-vehicle granularity (not just aggregate counts).
 
+    Only OPERATIONAL vehicles are considered — a vehicle whose Remarks column flags it as
+    under maintenance, scrapped, sold, etc. is excluded entirely from both Available and
+    Out (it's not a real dispatch candidate). If the Vehicle Database has no Remarks
+    column at all, every vehicle is treated as operational (unchanged, backward-compatible
+    behavior).
+
     Returns:
-      - fleet_status_df: every known vehicle from veh_db with a 'Status' column
-        ('Available' or 'Out'), 'Days Out' if out, and 'Distributor' — the
-        Route/Distributor recorded against that vehicle's gate-out entry, if the
-        log includes that column (blank/None if not out, or not recorded).
-      - unmatched_df: rows in the gate-out log whose Vehicle Number isn't in veh_db
-        (data-entry mismatches to flag, e.g. typos or vehicles outside the registered fleet).
+      - fleet_status_df: every known OPERATIONAL vehicle from veh_db with a 'Status'
+        column ('Available' or 'Out'), 'Days Out' if out, 'Distributor' — the
+        Route/Distributor recorded against that vehicle's gate-out entry, if the log
+        includes that column — and 'Remarks' (blank if the Vehicle Database has none).
+      - unmatched_df: gate-out log rows that couldn't be matched to an operational
+        vehicle, with a 'Reason' column distinguishing "Vehicle Number not found in
+        Vehicle Database" (likely a typo) from "Vehicle marked non-operational in
+        Vehicle Database" (someone logged a gate-out for a vehicle that's flagged as
+        not roadworthy — worth a second look).
     """
     fleet = veh_db.copy()
     fleet["Vehicle Number"] = fleet["Vehicle Number"].astype(str).str.strip().str.upper()
     fleet["OwnershipType"] = fleet["OwnershipType"].astype(str).str.title()
+
+    if "Remarks" in fleet.columns:
+        fleet["Remarks"] = fleet["Remarks"].astype(str).str.strip().replace({"nan": "", "None": ""})
+    else:
+        fleet["Remarks"] = ""
+    is_operational = _operational_mask(fleet["Remarks"])
+    non_operational_fleet = fleet[~is_operational].copy()
+    fleet = fleet[is_operational].copy()
+
     fleet["OwnershipOrder"] = fleet["OwnershipType"].map({"Own": 0, "Fixed": 1}).fillna(2)
     fleet = fleet.sort_values([
         "OwnershipOrder", "CapacityTonnage", "Vehicle Number"
@@ -564,8 +601,24 @@ def cross_reference_fleet(veh_db, currently_out_df):
 
     unmatched_df = pd.DataFrame()
     if currently_out_df is not None and not currently_out_df.empty:
-        known = set(fleet["Vehicle Number"])
-        unmatched_df = currently_out_df[~currently_out_df["Vehicle Number"].isin(known)].copy()
+        known_operational = set(fleet["Vehicle Number"])
+        known_non_operational = set(non_operational_fleet["Vehicle Number"]) if not non_operational_fleet.empty else set()
+
+        not_operational_entries = currently_out_df[
+            currently_out_df["Vehicle Number"].isin(known_non_operational)
+        ].copy()
+        if not not_operational_entries.empty:
+            not_operational_entries["Reason"] = "Vehicle marked non-operational in Vehicle Database"
+
+        truly_unmatched = currently_out_df[
+            ~currently_out_df["Vehicle Number"].isin(known_operational | known_non_operational)
+        ].copy()
+        if not truly_unmatched.empty:
+            truly_unmatched["Reason"] = "Vehicle Number not found in Vehicle Database"
+
+        parts = [d for d in (not_operational_entries, truly_unmatched) if not d.empty]
+        if parts:
+            unmatched_df = pd.concat(parts, ignore_index=True)
 
     return fleet, unmatched_df
 

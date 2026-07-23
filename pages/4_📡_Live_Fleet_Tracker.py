@@ -143,8 +143,16 @@ def filter_daily_load_rows(load_log_df, planning_date):
     if load_col is not None and load_col != "Load (Ton)":
         load_log_df = load_log_df.rename(columns={load_col: "Load (Ton)"})
 
-    if "Date" not in load_log_df.columns:
-        raise ValueError("Load Log sheet must contain a Date column named 'Date'.")
+    date_col = None
+    for c in load_log_df.columns:
+        key = str(c).strip().lower()
+        if key in ("date", "ship date", "shipment date", "order date", "dispatch date"):
+            date_col = c
+            break
+    if date_col is None:
+        raise ValueError("Load Log sheet must contain a Date column (e.g. 'Date').")
+    if date_col != "Date":
+        load_log_df = load_log_df.rename(columns={date_col: "Date"})
 
     load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
     if "Route / Distributor" not in load_log_df.columns:
@@ -266,8 +274,9 @@ else:
 fleet_status_df, unmatched_df = cross_reference_fleet(veh_db, currently_out_df)
 
 if not unmatched_df.empty:
-    st.warning(f"⚠️ **{len(unmatched_df)} gate-out entries** have a Vehicle Number that doesn't match your "
-               f"Vehicle Database — check for typos. These are excluded from the counts below.")
+    st.warning(f"⚠️ **{len(unmatched_df)} gate-out entries** couldn't be matched to an operational vehicle — "
+               f"see the Reason column below (typo in Vehicle Number, or the vehicle is marked "
+               f"non-operational in the Vehicle Database). These are excluded from the counts below.")
     with st.expander("See unmatched entries"):
         st.dataframe(unmatched_df, use_container_width=True, hide_index=True)
 
@@ -389,11 +398,16 @@ st.write("---")
 # A lightweight, read-only look at today's shipments (any status) — separate from, and
 # purely additive to, the Today's Load box below (which still does its own fetch/manual
 # fallback/planning exactly as before).
+if load_refresh:
+    fetch_load_sheet.clear()
+
 _summary_shipments_df = None
 _summary_fetch_error = None
+_summary_raw_df = None
 if load_sheet_url:
     try:
-        _summary_shipments_df = filter_daily_load_rows(fetch_load_sheet(load_sheet_url), as_of_date)
+        _summary_raw_df = fetch_load_sheet(load_sheet_url)
+        _summary_shipments_df = filter_daily_load_rows(_summary_raw_df, as_of_date)
     except Exception as e:
         _summary_fetch_error = str(e)
 
@@ -440,23 +454,49 @@ with st.container(border=True):
     shipments_df = None
     load_source_note = ""
 
-    if load_refresh:
-        fetch_load_sheet.clear()
-
     if load_sheet_url:
-        try:
-            load_log_df = fetch_load_sheet(load_sheet_url)
-            shipments_df = filter_daily_load_rows(load_log_df, as_of_date)
+        if _summary_fetch_error:
+            st.error(f"⚠️ Couldn't read Load Log sheet ({_summary_fetch_error}).")
+        else:
+            shipments_df = _summary_shipments_df
             load_source_note = f"Google Sheet ({as_of_date.strftime('%d %b %Y')})"
-            if not shipments_df.empty:
+            if shipments_df is not None and not shipments_df.empty:
                 st.dataframe(shipments_df, use_container_width=True, hide_index=True)
             else:
                 st.warning(
                     f"⚠️ No shipments found for {as_of_date.strftime('%d %b %Y')} in the Load Log sheet — "
                     "enter today's rows in the sheet or use the manual fallback below."
                 )
-        except Exception as e:
-            st.error(f"⚠️ Couldn't read Load Log sheet ({e}).")
+                with st.expander("🔍 Why is this empty? (diagnostic)"):
+                    if _summary_raw_df is not None:
+                        raw_preview = _summary_raw_df.copy()
+                        raw_preview.columns = [str(c).strip() for c in raw_preview.columns]
+                        st.write(f"**{len(raw_preview)}** total row(s) read from the sheet just now.")
+                        st.write(f"**Columns found:** {list(raw_preview.columns)}")
+                        date_col = next((c for c in raw_preview.columns if c.strip().lower() == "date"), None)
+                        if date_col:
+                            parsed_dates = pd.to_datetime(raw_preview[date_col], errors="coerce", dayfirst=True).dt.date
+                            unique_dates = sorted(set(d for d in parsed_dates.dropna()))
+                            st.write(f"**Comparing against 'As of date':** {as_of_date}")
+                            if unique_dates:
+                                shown = ", ".join(str(d) for d in unique_dates[-15:])
+                                st.write(f"**Dates found in the sheet (parsed):** {shown}")
+                            else:
+                                st.error("None of the Date values in the sheet could be parsed at all — "
+                                         "check the sheet's date format/column.")
+                            unparsed = int(parsed_dates.isna().sum())
+                            if unparsed:
+                                st.warning(f"{unparsed} row(s) had a Date value that couldn't be parsed.")
+                        else:
+                            st.error("No 'Date' column found at all in this sheet — check the header spelling.")
+                        st.dataframe(raw_preview.head(10), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "💡 If the data above looks correct but this is still empty, Google Sheets' own "
+                            "**\"Publish to web\"** CSV link updates on its own schedule and can lag a few minutes "
+                            "behind your edits — separate from this app's 60-second cache and the Refresh Now "
+                            "button. Try opening the CSV link itself in a new browser tab to see exactly what "
+                            "Google is serving right now."
+                        )
     else:
         st.info("Add a Load Log Sheet link in the sidebar.")
 
@@ -602,20 +642,24 @@ st.write("---")
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("✅ Available Vehicles (ready to dispatch)")
-    avail_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "CapacityTonnage"]
+    avail_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "CapacityTonnage", "Remarks"]
                   if c in fleet_status_df.columns]
-    avail_show = fleet_status_df[fleet_status_df["Status"] == "Available"][avail_cols]
+    avail_show = fleet_status_df[fleet_status_df["Status"] == "Available"][avail_cols].copy()
+    if "Remarks" in avail_show.columns:
+        avail_show["Remarks"] = avail_show["Remarks"].replace("", "—")
     st.dataframe(avail_show, use_container_width=True, height=320, hide_index=True)
     st.download_button("⬇️ Download available vehicles (CSV)", avail_show.to_csv(index=False).encode("utf-8"),
                         file_name=f"available_vehicles_{as_of_date}.csv", mime="text/csv")
 
 with c2:
     st.subheader("🚫 Vehicles Currently Out")
-    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "Distributor", "Days Out"]
+    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "Distributor", "Days Out", "Remarks"]
                 if c in fleet_status_df.columns]
     out_show = fleet_status_df[fleet_status_df["Status"] == "Out"][out_cols].copy()
     if "Distributor" in out_show.columns:
         out_show["Distributor"] = out_show["Distributor"].fillna("—")
+    if "Remarks" in out_show.columns:
+        out_show["Remarks"] = out_show["Remarks"].replace("", "—")
     if "Days Out" in out_show.columns:
         out_show = out_show.sort_values("Days Out", ascending=False)
     st.dataframe(out_show, use_container_width=True, height=320, hide_index=True)
