@@ -281,6 +281,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     "Capacity" column in the same unit.
     """
     avail = fleet_status_df[fleet_status_df["Status"] == "Available"].copy()
+    if "IsOperational" in avail.columns:
+        avail = avail[avail["IsOperational"]].copy()
     avail["OwnershipType"] = avail["OwnershipType"].astype(str).str.title()
     avail["Vehicle Number"] = avail["Vehicle Number"].astype(str).str.strip().str.upper()
     avail["OwnershipOrder"] = avail["OwnershipType"].map({"Own": 0, "Fixed": 1}).fillna(2)
@@ -292,10 +294,13 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
     fixed_pool = avail[avail["OwnershipType"] == "Fixed"].to_dict("records")
 
     # Fixed & Spot Hire ("market") vehicles physically top out at whatever the largest real
-    # Fixed vehicle in the WHOLE fleet is (not just currently-available ones — this is a
-    # structural size ceiling, not an availability question). Falls back to 18T if there's
-    # no Fixed vehicle on record at all.
+    # OPERATIONAL Fixed vehicle in the WHOLE fleet is (not just currently-available ones —
+    # this is a structural size ceiling, not an availability question; a non-operational
+    # vehicle's spec shouldn't inflate what's realistically deployable). Falls back to 18T
+    # if there's no operational Fixed vehicle on record at all.
     all_fixed = fleet_status_df[fleet_status_df["OwnershipType"].astype(str).str.title() == "Fixed"]
+    if "IsOperational" in all_fixed.columns:
+        all_fixed = all_fixed[all_fixed["IsOperational"]]
     fixed_spot_cap_tonnage = float(all_fixed["CapacityTonnage"].max()) if len(all_fixed) else 18.0
 
     capped_veh_block = veh_block[veh_block["TonnageNum"] <= fixed_spot_cap_tonnage + 1e-6].copy()
@@ -335,14 +340,22 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         else:
             shipment_fixed_spot_cap = fixed_spot_cap_tonnage
 
-        def assign_from_real_pool(remaining_load, pool, source_label, tier_max_tonnage):
-            """Covers as much of remaining_load as this tier's REAL vehicle pool allows —
-            matches directly against actual vehicle tonnages on hand (e.g. a real 6T, 6.5T
-            or 7T vehicle can serve a 6-ton load) rather than quantizing the load to the
-            nearest abstract size bucket first and then only searching for vehicles at or
-            above THAT bucket's threshold, which silently skips perfectly adequate real
-            vehicles sitting between buckets. Appends assignments to results; returns
-            whatever's still uncovered by this tier."""
+        def assign_from_real_pool(remaining_load, pool, source_label, tier_max_tonnage, tier_veh_block):
+            """Covers remaining_load using this tier's REAL vehicle pool — matches directly
+            against actual vehicle tonnages on hand (e.g. a real 6T, 6.5T or 7T vehicle can
+            serve a 6-ton load) rather than quantizing to an abstract size bucket first.
+
+            Avoids nickel-and-diming a shipment across many small vehicles when a better
+            option plausibly exists elsewhere: compares against the THEORETICAL ideal truck
+            count (using the tier's full size range, ignoring what's actually available
+            right now). If that ideal is small (<=2 trucks), a compact real combo should
+            exist somewhere — if this tier's real inventory can't match it, this tier
+            contributes NOTHING and the whole load rolls to the next tier (e.g. Own having
+            only small trucks defers a 22-ton load to Fixed's 18T, rather than sending 5
+            small Own trucks). But if the ideal ITSELF needs 3+ trucks — a tight distributor
+            tonnage cap, or a genuinely huge load — there's no better option to defer to, so
+            this tier uses as many of its own available vehicles as it takes, rather than
+            leaving a perfectly good real vehicle idle and sending everything to market."""
             if remaining_load <= 1e-6:
                 return 0.0
 
@@ -366,10 +379,48 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
                 })
                 return 0.0
 
-            # No single eligible vehicle suffices (load bigger than any one available
-            # truck, even with buffer) — greedily take the LARGEST eligible vehicles
-            # first (fewest trucks used), repeatedly, until covered or this tier's real
-            # pool (within the cap) runs out. Whatever's left rolls to the next tier.
+            _, ideal_trucks = allocate_trucks_by_tonnage(remaining_load, tier_veh_block, tier_max_tonnage, buffer)
+            truck_budget = max(2, ideal_trucks)
+
+            if truck_budget <= 4:
+                # Small enough to brute-force the tightest-fitting real combo.
+                best_combo, best_excess = None, None
+                for k in range(2, truck_budget + 1):
+                    idxs = eligible_idxs()
+                    if len(idxs) < k:
+                        break
+                    for combo in itertools.combinations(idxs, k):
+                        total_cap = sum(pool[i]["CapacityTonnage"] + buffer for i in combo)
+                        if total_cap >= remaining_load - 1e-6:
+                            excess = total_cap - remaining_load
+                            if best_excess is None or excess < best_excess:
+                                best_combo, best_excess = combo, excess
+                    if best_combo is not None:
+                        break  # prefer the smallest k that has a valid combo
+                if best_combo is not None:
+                    for i in sorted(best_combo, reverse=True):  # highest index first, keeps remaining indices valid
+                        v = pool.pop(i)
+                        results.append({
+                            "Vehicle Number": v["Vehicle Number"],
+                            "Truck Size": real_size_label(v),
+                            "Load": round(float(load), 2),
+                            "Source": source_label,
+                            "Distributor": distributor_label,
+                        })
+                    return 0.0
+                if truck_budget <= 2:
+                    # The ideal itself was compact and this tier's real inventory can't
+                    # match it — a better option likely exists in the next tier.
+                    return remaining_load
+                # else: ideal needed 3-4 trucks but no combo of exactly that many exists
+                # in the real pool (could still be short a vehicle or two) — fall through
+                # to the greedy fallback below rather than giving up.
+
+            # Reached only when the theoretical ideal itself needs several trucks (a tight
+            # tonnage cap, or a genuinely huge load) — no better single/dual-truck option
+            # exists anywhere, so use as many of this tier's own real vehicles as it takes.
+            # Greedily take the LARGEST eligible vehicle each round (fewest trucks for the
+            # capacity available), repeatedly, until covered or this tier's pool runs out.
             remaining = remaining_load
             while remaining > 1e-6:
                 idxs = eligible_idxs()
@@ -388,8 +439,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             return max(0.0, remaining)
 
         remaining = float(load)
-        remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap)
-        remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap)
+        remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap, veh_block)
+        remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap, capped_veh_block)
 
         if remaining > 1e-6:
             # Spot Hire — no real fleet to check against, so it falls back to the standard
@@ -555,16 +606,21 @@ def cross_reference_fleet(veh_db, currently_out_df):
     from both Available and Out. If the Vehicle Database has no Remarks column at all,
     every vehicle is treated as operational (unchanged, backward-compatible behavior).
 
+    Every known vehicle is included in fleet_status_df (Available or Out) regardless of
+    operational status — non-operational vehicles stay fully visible (with their Remarks)
+    so you can see your whole fleet, not just the dispatchable subset. The 'IsOperational'
+    column marks which ones are real dispatch candidates; allocate_shipments_to_fleet uses
+    it to only draw from operational vehicles when assigning loads, without hiding the
+    rest from these tables.
+
     Returns:
-      - fleet_status_df: every known OPERATIONAL vehicle from veh_db with a 'Status'
-        column ('Available' or 'Out'), 'Days Out' if out, 'Distributor' — the
+      - fleet_status_df: every known vehicle from veh_db with a 'Status' column
+        ('Available' or 'Out'), 'Days Out' if out, 'Distributor' — the
         Route/Distributor recorded against that vehicle's gate-out entry, if the log
-        includes that column — and 'Remarks' (blank if the Vehicle Database has none).
-      - unmatched_df: gate-out log rows that couldn't be matched to an operational
-        vehicle, with a 'Reason' column distinguishing "Vehicle Number not found in
-        Vehicle Database" (likely a typo) from "Vehicle marked non-operational in
-        Vehicle Database" (someone logged a gate-out for a vehicle that isn't flagged
-        as operational — worth a second look).
+        includes that column — 'Remarks' (blank if the Vehicle Database has none), and
+        'IsOperational' (True if the Vehicle Database has no Remarks column at all).
+      - unmatched_df: gate-out log rows whose Vehicle Number isn't in the Vehicle
+        Database at all (likely a typo) — flagged with a 'Reason' column.
     """
     fleet = veh_db.copy()
     fleet["Vehicle Number"] = fleet["Vehicle Number"].astype(str).str.strip().str.upper()
@@ -575,9 +631,7 @@ def cross_reference_fleet(veh_db, currently_out_df):
         fleet["Remarks"] = fleet["Remarks"].astype(str).str.strip().replace({"nan": "", "None": ""})
     else:
         fleet["Remarks"] = ""
-    is_operational = _operational_mask(fleet["Remarks"], remarks_col_present)
-    non_operational_fleet = fleet[~is_operational].copy()
-    fleet = fleet[is_operational].copy()
+    fleet["IsOperational"] = _operational_mask(fleet["Remarks"], remarks_col_present)
 
     fleet["OwnershipOrder"] = fleet["OwnershipType"].map({"Own": 0, "Fixed": 1}).fillna(2)
     fleet = fleet.sort_values([
@@ -604,24 +658,11 @@ def cross_reference_fleet(veh_db, currently_out_df):
 
     unmatched_df = pd.DataFrame()
     if currently_out_df is not None and not currently_out_df.empty:
-        known_operational = set(fleet["Vehicle Number"])
-        known_non_operational = set(non_operational_fleet["Vehicle Number"]) if not non_operational_fleet.empty else set()
-
-        not_operational_entries = currently_out_df[
-            currently_out_df["Vehicle Number"].isin(known_non_operational)
-        ].copy()
-        if not not_operational_entries.empty:
-            not_operational_entries["Reason"] = "Vehicle marked non-operational in Vehicle Database"
-
-        truly_unmatched = currently_out_df[
-            ~currently_out_df["Vehicle Number"].isin(known_operational | known_non_operational)
-        ].copy()
+        known = set(fleet["Vehicle Number"])
+        truly_unmatched = currently_out_df[~currently_out_df["Vehicle Number"].isin(known)].copy()
         if not truly_unmatched.empty:
             truly_unmatched["Reason"] = "Vehicle Number not found in Vehicle Database"
-
-        parts = [d for d in (not_operational_entries, truly_unmatched) if not d.empty]
-        if parts:
-            unmatched_df = pd.concat(parts, ignore_index=True)
+            unmatched_df = truly_unmatched
 
     return fleet, unmatched_df
 
