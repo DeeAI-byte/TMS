@@ -6,20 +6,55 @@ import itertools
 import os
 import requests
 from folium.plugins import PolyLineTextPath
+from datetime import date
+import sys
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.data_loader import (
+    load_locations, load_vehicle_database, load_assumptions,
+    cross_reference_fleet, allocate_shipments_to_fleet
+)
 
 # Page Layout Configurations
 st.set_page_config(page_title="Interactive Logistics Router", page_icon="🛠️", layout="wide")
-
-# Safe Formatting (No extra background color blocks)
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
-# Streamlit Native Header
-st.title("🛠️ Route Creation")
+st.title("🛠️ Route Creation & Dispatch Management")
+st.caption("Punch dispatch details directly below — replaces external Google Sheets with live fleet locking & routing.")
 st.write("---")
 
-excel_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "locations.xlsx")
+# Load Locations & Vehicle Database
+try:
+    df_loc = load_locations()
+    wh_df = df_loc[df_loc["Type"].isin(["Warehouse", "Plant"])]
+    dbr_df = df_loc[df_loc["Type"] == "DBR"]
+    
+    plant_list = sorted(wh_df["Name"].dropna().unique())
+    dbr_list = sorted(dbr_df["Name"].dropna().unique())
+    veh_db = load_vehicle_database()
+    veh_block, _ = load_assumptions()
+except Exception as e:
+    st.error(f"⚠️ Could not load database files: {e}")
+    st.stop()
 
-# OSRM Road Distance & Path Generator
+# Initialize Session State Data Tables
+if "dispatch_table" not in st.session_state:
+    st.session_state.dispatch_table = pd.DataFrame({
+        "Date": [date.today()],
+        "Plant": [plant_list[0] if plant_list else "Plant 1"],
+        "Route / Distributor": [dbr_list[0] if dbr_list else "None"],
+        "Total Load (Ton)": [10.0],
+        "Dispatch Status": ["Pending"],
+        "Assigned Vehicle": ["Unassigned"]
+    })
+
+if "gate_out_log" not in st.session_state:
+    st.session_state.gate_out_log = pd.DataFrame(columns=[
+        "Vehicle Number", "Tonnage", "Ownership", "Gate Out Date",
+        "Actual Return Date", "Route / Distributor"
+    ])
+
+# Helper Function: OSRM Road Distance & Geometry
 def get_road_route_and_distance(coords_list):
     loc_string = ";".join([f"{lon},{lat}" for lat, lon in coords_list])
     url = f"http://router.project-osrm.org/route/v1/driving/{loc_string}?overview=full&geometries=geojson"
@@ -34,190 +69,145 @@ def get_road_route_and_distance(coords_list):
         pass
     return None, None
 
-if not os.path.exists(excel_file):
-    st.error(f"⚠️ '{excel_file}' file nahi mili!")
-else:
-    df = pd.read_excel(excel_file)
-    df.columns = df.columns.str.strip()
-    cols = list(df.columns)
+# ---------------- INTERACTIVE DISPATCH TABLE ----------------
+st.subheader("📋 Route & Load Entry Table")
 
-    name_col = cols[0]
-    type_col = cols[1]
-    lat_col = next((c for c in cols if 'lat' in c.lower()), cols[2])
-    lon_col = next((c for c in cols if 'lon' in c.lower() or 'long' in c.lower()), cols[3])
+edited_df = st.data_editor(
+    st.session_state.dispatch_table,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="dispatch_table_editor",
+    column_config={
+        "Date": st.column_config.DateColumn("Date", default=date.today()),
+        "Plant": st.column_config.SelectboxColumn("Plant / Warehouse", options=plant_list, required=True),
+        "Route / Distributor": st.column_config.SelectboxColumn("Route / Distributor", options=dbr_list, required=True),
+        "Total Load (Ton)": st.column_config.NumberColumn("Total Load (Ton)", min_value=0.0, step=0.5, format="%.1f"),
+        "Dispatch Status": st.column_config.SelectboxColumn(
+            "Dispatch Status", 
+            options=["Pending", "Alloted", "Dispatched", "Cancelled"], 
+            default="Pending"
+        ),
+        "Assigned Vehicle": st.column_config.TextColumn("Assigned Vehicle", disabled=True)
+    }
+)
 
-    # Filter Datasets
-    wh_df = df[df[type_col].isin(['Warehouse', 'Plant'])]
-    dbr_df = df[df[type_col] == 'DBR']
-    dbr_list = ["None"] + list(dbr_df[name_col].unique())
+# ---------------- STATE TRANSITION & VEHICLE LOCKING LOGIC ----------------
+processed_df = edited_df.copy()
+currently_out_df = st.session_state.gate_out_log.copy()
+fleet_status_df, _ = cross_reference_fleet(veh_db, currently_out_df)
 
-    # 🌟 WAREHOUSE SELECT MEIN "NONE" KA OPTION JOD DIYA HAI
-    wh_list = ["None"] + list(wh_df[name_col].unique())
+veh_block_tons = veh_block[["Vehicle", "TonnageNum"]].copy()
+veh_block_tons["TonnageNum"] = pd.to_numeric(veh_block_tons["TonnageNum"], errors="coerce")
+veh_block_tons = veh_block_tons.dropna(subset=["TonnageNum"])
+veh_block_tons["Capacity"] = veh_block_tons["TonnageNum"]
 
-    # --- STATE MANAGEMENT ---
-    if 'sel_wh' not in st.session_state: st.session_state.sel_wh = wh_list[1] if len(wh_list) > 1 else "None"
-    if 'sel_d1' not in st.session_state: st.session_state.sel_d1 = "None"
-    if 'sel_d2' not in st.session_state: st.session_state.sel_d2 = "None"
-    if 'sel_d3' not in st.session_state: st.session_state.sel_d3 = "None"
+gate_out_rows = list(st.session_state.gate_out_log.to_dict("records"))
 
-    # --- SIDEBAR PANEL ---
-    st.sidebar.header("🕹️ Configuration")
+for i, row in processed_df.iterrows():
+    status = row["Dispatch Status"]
+    current_assigned = row["Assigned Vehicle"]
+    distributor = row["Route / Distributor"]
+    load_ton = row["Total Load (Ton)"]
+    dispatch_date = row["Date"]
 
-    if st.sidebar.button("🧹 Clear Route", use_container_width=True):
-        st.session_state.sel_wh = wh_list[1] if len(wh_list) > 1 else "None"
-        st.session_state.sel_d1 = "None"
-        st.session_state.sel_d2 = "None"
-        st.session_state.sel_d3 = "None"
-        st.rerun()
+    # 1. Handle ALLOTED status (Auto-match and lock vehicle)
+    if status == "Alloted" and (current_assigned in ["Unassigned", "", None] or current_assigned.startswith("(market)")):
+        alloc_res = allocate_shipments_to_fleet(
+            loads=[load_ton],
+            fleet_status_df=fleet_status_df,
+            veh_block=veh_block_tons,
+            buffer=1.0,
+            distributors=[distributor]
+        )
+        if alloc_res:
+            assigned_v = alloc_res[0]["Vehicle Number"]
+            processed_df.at[i, "Assigned Vehicle"] = assigned_v
+            # Temporarily set vehicle as Out so next row won't double-book it
+            if assigned_v != "(market)":
+                fleet_status_df.loc[fleet_status_df["Vehicle Number"] == assigned_v, "Status"] = "Out"
 
-    st.sidebar.write("---")
+    # 2. Handle DISPATCHED status (Lock vehicle & Trigger Gate-Out record)
+    elif status == "Dispatched":
+        v_num = current_assigned
+        if v_num in ["Unassigned", "", None]:
+            alloc_res = allocate_shipments_to_fleet(
+                loads=[load_ton],
+                fleet_status_df=fleet_status_df,
+                veh_block=veh_block_tons,
+                buffer=1.0,
+                distributors=[distributor]
+            )
+            v_num = alloc_res[0]["Vehicle Number"] if alloc_res else "(market)"
+            processed_df.at[i, "Assigned Vehicle"] = v_num
 
-    def update_wh(): st.session_state.sel_wh = st.session_state.sb_wh
-    def update_d1(): st.session_state.sel_d1 = st.session_state.sb_d1
-    def update_d2(): st.session_state.sel_d2 = st.session_state.sb_d2
-    def update_d3(): st.session_state.sel_d3 = st.session_state.sb_d3
+        # Check if already logged in Gate-Out
+        already_logged = any(
+            g["Vehicle Number"] == v_num and str(g["Route / Distributor"]) == str(distributor)
+            for g in gate_out_rows
+        )
+        if not already_logged and v_num != "(market)":
+            v_info = veh_db[veh_db["Vehicle Number"] == v_num]
+            v_tonnage = v_info.iloc[0]["CapacityTonnage"] if not v_info.empty else 0.0
+            v_ownership = v_info.iloc[0]["OwnershipType"] if not v_info.empty else "Own"
 
-    st.sidebar.selectbox("Warehouse/Plant:", wh_list, key="sb_wh", index=wh_list.index(st.session_state.sel_wh), on_change=update_wh)
+            gate_out_rows.append({
+                "Vehicle Number": v_num,
+                "Tonnage": v_tonnage,
+                "Ownership": v_ownership,
+                "Gate Out Date": str(dispatch_date),
+                "Actual Return Date": "",
+                "Route / Distributor": distributor
+            })
 
-    st.sidebar.write("**Selected Route DBRs:**")
-    st.sidebar.selectbox("DBR 1:", dbr_list, key="sb_d1", index=dbr_list.index(st.session_state.sel_d1), on_change=update_d1)
-    st.sidebar.selectbox("DBR 2:", dbr_list, key="sb_d2", index=dbr_list.index(st.session_state.sel_d2), on_change=update_d2)
-    st.sidebar.selectbox("DBR 3:", dbr_list, key="sb_d3", index=dbr_list.index(st.session_state.sel_d3), on_change=update_d3)
+st.session_state.dispatch_table = processed_df
+st.session_state.gate_out_log = pd.DataFrame(gate_out_rows)
 
-    active_dbrs = [d for d in [st.session_state.sel_d1, st.session_state.sel_d2, st.session_state.sel_d3] if d != "None"]
+st.write("---")
 
-    # Coordinates mapping logic based on selections
-    selected_coords = []
-    selected_names = []
+# ---------------- MAP & ROUTE OPTIMIZATION ----------------
+row_options = [
+    f"Row {i+1} — {r['Plant']} ➔ {r['Route / Distributor']} ({r['Dispatch Status']} | {r['Assigned Vehicle']})" 
+    for i, r in processed_df.iterrows()
+]
 
-    if st.session_state.sel_wh != "None":
-        w_r = df[df[name_col] == st.session_state.sel_wh].iloc[0]
-        selected_coords.append((float(w_r[lat_col]), float(w_r[lon_col])))
-        selected_names.append(w_r[name_col])
-        # Map centering location determination
-        center_lat, center_lon = float(w_r[lat_col]), float(w_r[lon_col])
-    else:
-        # Default map center if Warehouse is None (taking first available row)
-        center_lat, center_lon = float(df.iloc[0][lat_col]), float(df.iloc[0][lon_col])
+if row_options:
+    selected_idx = st.selectbox("📌 Select a row from the table to map & inspect route:", range(len(row_options)), format_func=lambda x: row_options[x])
+    selected_row = processed_df.iloc[selected_idx]
 
-    for d_name in active_dbrs:
-        r = df[df[name_col] == d_name].iloc[0]
-        selected_coords.append((float(r[lat_col]), float(r[lon_col])))
-        selected_names.append(r[name_col])
+    sel_plant = selected_row["Plant"]
+    sel_dbr = selected_row["Route / Distributor"]
+    total_load = selected_row["Total Load (Ton)"]
+    dispatch_status = selected_row["Dispatch Status"]
+    assigned_v = selected_row["Assigned Vehicle"]
 
-    min_road_distance = 0
-    best_road_geometry = None
-    best_route_indices = [0] + list(range(1, len(selected_names))) + [0] if st.session_state.sel_wh != "None" else list(range(len(selected_names)))
+    # Coordinates calculation
+    plant_row = df_loc[df_loc["Name"] == sel_plant]
+    dbr_row = df_loc[df_loc["Name"] == sel_dbr]
 
-    # Route generation logic runs only if Warehouse is selected AND DBRs exist
-    if st.session_state.sel_wh != "None" and len(active_dbrs) > 0:
-        min_road_distance = float('inf')
-        dbr_num = len(active_dbrs)
-        for perm in itertools.permutations(range(1, dbr_num + 1)):
-            current_perm_indices = [0] + list(perm) + [0]
-            current_perm_coords = [selected_coords[idx] for idx in current_perm_indices]
-            dist, geom = get_road_route_and_distance(current_perm_coords)
+    if not plant_row.empty and not dbr_row.empty:
+        p_coords = (float(plant_row.iloc[0]["Latitude"]), float(plant_row.iloc[0]["Longitude"]))
+        d_coords = (float(dbr_row.iloc[0]["Latitude"]), float(dbr_row.iloc[0]["Longitude"]))
 
-            if dist is not None and dist < min_road_distance:
-                min_road_distance = dist
-                best_route_indices = current_perm_indices
-                best_road_geometry = geom
+        dist_km, road_geom = get_road_route_and_distance([p_coords, d_coords, p_coords])
 
-        if not best_road_geometry:
-            min_road_distance = 0
-            best_road_geometry = [selected_coords[idx] for idx in best_route_indices]
+        c1, c2 = st.columns([1, 3])
+        with c1:
+            st.subheader("📊 Route Overview")
+            st.metric("Total Load", f"{total_load} Ton")
+            st.metric("Status", dispatch_status)
+            st.metric("Assigned Truck", assigned_v)
+            if dist_km:
+                st.metric("Road Distance", f"{round(dist_km, 2)} KM")
+            st.write(f"🏭 **Origin:** {sel_plant}")
+            st.write(f"📍 **Destination:** {sel_dbr}")
 
-    route_names = [selected_names[idx] for idx in best_route_indices] if (st.session_state.sel_wh != "None" or len(active_dbrs) > 0) else []
+        with c2:
+            m = folium.Map(location=p_coords, zoom_start=9)
+            folium.Marker(p_coords, popup=f"Plant: {sel_plant}", icon=folium.Icon(color="red", icon="industry", prefix="fa")).add_to(m)
+            folium.Marker(d_coords, popup=f"DBR: {sel_dbr}", icon=folium.Icon(color="blue", icon="shopping-cart")).add_to(m)
 
-    stop_order_dict = {}
-    for step, name in enumerate(route_names):
-        if step != 0 and step != len(route_names) - 1:
-            if name not in stop_order_dict:
-                stop_order_dict[name] = len(stop_order_dict) + 1
+            if road_geom:
+                line = folium.PolyLine(road_geom, color="#1b4fd2", weight=5, opacity=0.85).add_to(m)
+                PolyLineTextPath(line, '  ►  ', repeat=True, offset=8, attributes={'fill': '#ffffff', 'font-weight': 'bold'}).add_to(m)
 
-    # --- UI GRID WORKSPACE ---
-    c1, c2 = st.columns([1, 3])
-
-    with c1:
-        if st.session_state.sel_wh == "None":
-            st.info("💡 Please select a Warehouse/Plant to start routing configuration.")
-        elif len(active_dbrs) > 0:
-            st.metric(label="Total Distance", value=f"{round(min_road_distance, 2)} KM")
-
-            st.write("**Route Sequence:**")
-            for step, name in enumerate(route_names):
-                if step == 0:
-                    st.write(f"🏭 **{step+1}. {name} (Start)**")
-                elif step == len(route_names) - 1:
-                    st.write(f"🏢 **{step+1}. {name} (Return)**")
-                else:
-                    st.write(f"📍 **{step+1}. {name}**")
-
-
-    with c2:
-        m = folium.Map(location=(center_lat, center_lon), zoom_start=10)
-
-        for _, row in df.iterrows():
-            loc_name = row[name_col]
-            is_wh = row[type_col] in ['Warehouse', 'Plant']
-
-            # 🌟 MAP KE SABHI WAREHOUSES PAR BADA KHOOBSURAT ICON LAGEGA
-            if is_wh:
-                # Custom big vector icon logic applied universally to all warehouses
-                icon_html = """
-                <div style="
-                    background-color: #e74c3c;
-                    border: 3px solid #ffffff;
-                    border-radius: 50%;
-                    width: 50px;
-                    height: 50px;
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    box-shadow: 0px 4px 10px rgba(0,0,0,0.4);
-                ">
-                    <span style="font-size: 24px; color: white;">🏭</span>
-                </div>
-                """
-                marker_icon = folium.DivIcon(html=icon_html, icon_size=(50, 50), icon_anchor=(25, 25))
-
-                # Agar ye specific warehouse current select hua hai toh extra highlighting text label dikhao
-                if loc_name == st.session_state.sel_wh:
-                    label_html = f"<div style='font-size: 14px; font-weight: bold; color: white; background: #e74c3c; padding: 4px 8px; border-radius: 4px; border: 2px solid white; white-space: nowrap; box-shadow: 2px 2px 5px rgba(0,0,0,0.2);'>🏭 START: {loc_name}</div>"
-                    popup_html = f"<b>{loc_name}</b><br><span style='color:red; font-weight:bold;'>Selected Active Origin</span>"
-                    folium.map.Marker((row[lat_col], row[lon_col]), icon=folium.features.DivIcon(html=label_html, icon_size=(0,0), icon_anchor=(-20,35))).add_to(m)
-                else:
-                    label_html = f"<div style='font-size: 11px; font-weight: bold; color: #333; background: #ffffff; padding: 3px 5px; border: 1px solid #999; border-radius: 3px; white-space: nowrap;'>{loc_name}</div>"
-                    popup_html = f"<b>{loc_name}</b><br><span style='color:gray;'>Type: {row[type_col]}</span>"
-                    folium.map.Marker((row[lat_col], row[lon_col]), icon=folium.features.DivIcon(html=label_html, icon_size=(0,0), icon_anchor=(-10,15))).add_to(m)
-
-                folium.Marker(location=(row[lat_col], row[lon_col]), icon=marker_icon, popup=folium.Popup(popup_html, max_width=250)).add_to(m)
-
-            else:
-                # DBR Points Rendering Logic
-                if loc_name in active_dbrs:
-                    color, icon = 'blue', 'shopping-cart'
-                    stop_num = stop_order_dict.get(loc_name, 1)
-                    label_html = f"<div style='font-size: 14px; font-weight: bold; color: #d93838; background: #fff0f0; padding: 4px 8px; border-radius: 4px; border: 2.5px solid #d93838; box-shadow: 2px 2px 5px rgba(0,0,0,0.3); white-space: nowrap;'>🚨 [{stop_num}] {loc_name}</div>"
-                    popup_html = f"<b>{loc_name}</b><br><span style='color:green;'>Active Destination Point</span>"
-                else:
-                    color, icon = 'gray', 'info-sign'
-                    label_html = f"<div style='font-size: 11px; font-weight: bold; color: #333; background: #ffffff; padding: 3px 5px; border: 1px solid #999; border-radius: 3px; white-space: nowrap;'>{loc_name}</div>"
-                    popup_html = f"<b>{loc_name}</b><br><span style='color:gray;'>Type: {row[type_col]}</span>"
-
-                folium.Marker(location=(row[lat_col], row[lon_col]), icon=folium.Icon(color=color, icon=icon), popup=folium.Popup(popup_html, max_width=250)).add_to(m)
-                folium.map.Marker((row[lat_col], row[lon_col]), icon=folium.features.DivIcon(html=label_html, icon_size=(0,0), icon_anchor=(-10,15))).add_to(m)
-
-        # --- PATH ARROWS WITH SPACED OUT ORIENTATION ---
-        if st.session_state.sel_wh != "None" and best_road_geometry:
-            line = folium.PolyLine(best_road_geometry, color="#1b4fd2", weight=6, opacity=0.85).add_to(m)
-
-            PolyLineTextPath(
-                line,
-                '                ►                ',
-                repeat=True,
-                offset=8,
-                attributes={'fill': '#ffffff', 'font-weight': 'bold', 'font-size': '15px'}
-            ).add_to(m)
-
-        st_folium(m, width=980, height=600, key="road_geometry_fixed_map", returned_objects=[])
+            st_folium(m, width=900, height=500, key="route_map", returned_objects=[])
