@@ -4,8 +4,18 @@ import folium
 from streamlit_folium import st_folium
 import itertools
 import os
+import sys
 import requests
+from datetime import date
 from folium.plugins import PolyLineTextPath
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.data_loader import (
+    load_locations, load_vehicle_database, load_assumptions, load_db_capacity,
+    cross_reference_fleet, process_gate_out_log, init_session_tables,
+    lock_in_alloted_vehicles, sync_dispatch_to_gate_out,
+    DISPATCH_STATUS_OPTIONS
+)
 
 # Page Layout Configurations
 st.set_page_config(page_title="Interactive Logistics Router", page_icon="🛠️", layout="wide")
@@ -221,3 +231,87 @@ else:
             ).add_to(m)
 
         st_folium(m, width=980, height=600, key="road_geometry_fixed_map", returned_objects=[])
+
+# ============================================================================
+# 📋 DAILY DISPATCH TABLE — native replacement for the Load Log Google Sheet
+# ============================================================================
+st.write("---")
+st.header("📋 Daily Dispatch Table")
+st.caption(
+    "This table is the single source of truth for today's (and every day's) shipments — "
+    "no Google Sheet needed. Add a row, pick a distributor and load, then move it through "
+    "**Pending → Alloted → Dispatched**. A vehicle is picked and LOCKED IN the moment a row "
+    "becomes Alloted (never recomputed after that); marking it Dispatched automatically "
+    "creates the matching Gate-Out Log entry on the Live Fleet Tracker page."
+)
+
+init_session_tables()
+
+# DBR distributor points for the dropdown, same source as the map above.
+try:
+    _loc_df = load_locations()
+    distributor_options = sorted(_loc_df[_loc_df["Type"] == "DBR"]["Name"].dropna().unique().tolist())
+except Exception:
+    distributor_options = []
+
+edited_dispatch = st.data_editor(
+    st.session_state.dispatch_table,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="dispatch_table_editor",
+    column_config={
+        "Date": st.column_config.DateColumn("Date", default=date.today()),
+        "Route / Distributor": st.column_config.SelectboxColumn(
+            "Route / Distributor", options=distributor_options, required=False
+        ) if distributor_options else st.column_config.TextColumn("Route / Distributor"),
+        "Total Load (Ton)": st.column_config.NumberColumn(
+            "Total Load (Ton)", min_value=0.0, step=0.1, format="%.1f"
+        ),
+        "Dispatch Status": st.column_config.SelectboxColumn(
+            "Dispatch Status", options=DISPATCH_STATUS_OPTIONS, default="Pending", required=True
+        ),
+        "Assigned Vehicle": st.column_config.TextColumn(
+            "Assigned Vehicle", help="Auto-filled and LOCKED once a row becomes Alloted. "
+                                      "Leave blank for Pending rows — the Live Fleet Tracker "
+                                      "plans those live."
+        ),
+    },
+)
+
+# Backfill defaults for any newly-added blank row so downstream logic never sees NaN.
+edited_dispatch["Date"] = edited_dispatch["Date"].fillna(date.today())
+edited_dispatch["Dispatch Status"] = edited_dispatch["Dispatch Status"].fillna("Pending")
+edited_dispatch["Assigned Vehicle"] = edited_dispatch["Assigned Vehicle"].fillna("").astype(str).str.strip()
+edited_dispatch["Total Load (Ton)"] = pd.to_numeric(edited_dispatch["Total Load (Ton)"], errors="coerce")
+
+# --- Lock in a vehicle the moment a row becomes Alloted ---
+try:
+    _veh_db = load_vehicle_database()
+    _veh_block, _ = load_assumptions()
+    _veh_block_tons = _veh_block[["Vehicle", "TonnageNum"]].copy()
+    _veh_block_tons["Capacity"] = _veh_block_tons["TonnageNum"]
+    _db_capacity = load_db_capacity()
+
+    _, _currently_out = process_gate_out_log(st.session_state.gate_out_log, date.today())
+    _fleet_status_df, _ = cross_reference_fleet(_veh_db, _currently_out)
+
+    edited_dispatch = lock_in_alloted_vehicles(
+        edited_dispatch, _fleet_status_df, _veh_block_tons, buffer=1.0,
+        max_tonnage=None, db_capacity_df=_db_capacity
+    )
+except Exception as e:
+    st.warning(f"⚠️ Couldn't auto-assign vehicles for Alloted rows right now: {e}")
+
+# --- Dispatched rows automatically create their Gate-Out Log entry ---
+st.session_state.gate_out_log = sync_dispatch_to_gate_out(
+    edited_dispatch, st.session_state.gate_out_log, load_vehicle_database(), date.today()
+)
+
+st.session_state.dispatch_table = edited_dispatch
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Total Shipments", f"{len(edited_dispatch):,}")
+d2.metric("Pending", f"{int((edited_dispatch['Dispatch Status'] == 'Pending').sum()):,}")
+d3.metric("Alloted", f"{int((edited_dispatch['Dispatch Status'] == 'Alloted').sum()):,}")
+d4.metric("Dispatched", f"{int((edited_dispatch['Dispatch Status'] == 'Dispatched').sum()):,}")
+

@@ -796,18 +796,222 @@ def simulate_daily_allocation(daily_requirements, own_total, fixed_total,
         own_dispatch_history[day] = own_used
         fixed_dispatch_history[day] = fixed_used
 
-        rows.append({
-            "Day": day + 1,
-            "Trucks Required": need,
-            "Own Available": own_available,
-            "Own Used": own_used,
-            "Own Idle": own_available - own_used,
-            "Fixed Available": fixed_available,
-            "Fixed Used": fixed_used,
-            "Fixed Idle": fixed_available - fixed_used,
-            "Spot Hire Used": spot_used,
-            "Own In-Transit (after today)": int(round(own_still_out)) + own_used,
-            "Fixed In-Transit (after today)": int(round(fixed_still_out)) + fixed_used,
+
+# --------------------------------------------------------------------------------------
+# SESSION-STATE DISPATCH TABLE & GATE-OUT LOG (native replacement for Google Sheets)
+# --------------------------------------------------------------------------------------
+# The whole app used to read two live Google Sheets (Load Log, Gate-Out Log). Both are
+# now native in-app tables living in st.session_state, shared automatically across pages
+# within the same browser session — Route Creation writes them, Live Fleet Tracker reads
+# (and also writes, for Gate-In returns). All the actual matching/allocation logic below
+# (allocate_shipments_to_fleet, cross_reference_fleet, process_gate_out_log) is completely
+# unchanged; only the data SOURCE moved from a Google Sheet fetch to these tables.
+
+DISPATCH_STATUS_OPTIONS = ["Pending", "Alloted", "Dispatched", "Cancelled"]
+
+DISPATCH_COLUMNS = ["Date", "Route / Distributor", "Total Load (Ton)", "Dispatch Status", "Assigned Vehicle"]
+GATE_OUT_COLUMNS = ["Vehicle Number", "Ownership", "Capacity Tonnage", "Gate Out Date",
+                     "Actual Return Date", "Route / Distributor"]
+
+
+def init_session_tables():
+    """
+    Creates the dispatch table and gate-out log in st.session_state if they don't already
+    exist in this browser session. Call this at the top of EVERY page that touches either
+    table (Route Creation, Live Fleet Tracker) — it's a no-op after the first call, so it's
+    always safe to call unconditionally.
+    """
+    if "dispatch_table" not in st.session_state:
+        st.session_state.dispatch_table = pd.DataFrame({
+            "Date": pd.Series(dtype="object"),
+            "Route / Distributor": pd.Series(dtype="object"),
+            "Total Load (Ton)": pd.Series(dtype="float"),
+            "Dispatch Status": pd.Series(dtype="object"),
+            "Assigned Vehicle": pd.Series(dtype="object"),
+        })
+    if "gate_out_log" not in st.session_state:
+        st.session_state.gate_out_log = pd.DataFrame({
+            "Vehicle Number": pd.Series(dtype="object"),
+            "Ownership": pd.Series(dtype="object"),
+            "Capacity Tonnage": pd.Series(dtype="float"),
+            "Gate Out Date": pd.Series(dtype="object"),
+            "Actual Return Date": pd.Series(dtype="object"),
+            "Route / Distributor": pd.Series(dtype="object"),
         })
 
-    return rows
+
+def match_distributor_cap(name, db_capacity_df):
+    """
+    Matches a shipment's distributor name against the Distributor-wise Max Vehicle
+    Capacity sheet. Two real-world wrinkles this handles:
+
+    A) A shipment's own naming sometimes embeds an extra location suffix that the capacity
+       sheet's Distributor name doesn't have, e.g. "JAISWAL ENTERPRISES BANTHRA" vs. the
+       sheet's plain "Jaiswal Enterprises" — an exact-string match would miss this
+       entirely, so it falls back to the longest Distributor name the shipment's name
+       STARTS WITH.
+    B) The SAME distributor name can repeat across different towns with DIFFERENT caps
+       (e.g. "Jaiswal Enterprises" is both Bani Banthra [9T] and Narhat [4T]). When that
+       happens, it disambiguates using the Town — e.g. "banthra" appearing inside
+       "JAISWAL ENTERPRISES BANTHRA" — to pick the right one. Still ambiguous -> uses the
+       smaller (more conservative) cap rather than guessing the larger one.
+
+    No match at all -> None (no cap applied).
+    """
+    norm_name = str(name).strip().casefold()
+    if not norm_name or db_capacity_df is None or db_capacity_df.empty:
+        return None
+
+    all_names = db_capacity_df["Distributor"].astype(str).str.strip().str.casefold()
+
+    candidates = db_capacity_df[all_names == norm_name]
+    if candidates.empty:
+        prefix_mask = all_names.apply(lambda n: bool(n) and norm_name.startswith(n))
+        prefix_matches = db_capacity_df[prefix_mask]
+        if not prefix_matches.empty:
+            name_lens = prefix_matches["Distributor"].astype(str).str.strip().str.len()
+            candidates = prefix_matches[name_lens == name_lens.max()]
+
+    if candidates.empty:
+        return None
+
+    caps = candidates["MaxVehicleTonnage"].dropna().unique()
+    if len(caps) == 0:
+        return None
+    if len(caps) == 1:
+        return float(caps[0])
+
+    for _, r in candidates.iterrows():
+        town = str(r.get("Town", "")).strip().casefold()
+        cap = r.get("MaxVehicleTonnage")
+        if not town or pd.isna(cap):
+            continue
+        if town in norm_name:
+            return float(cap)
+        for word in town.split():
+            if len(word) >= 4 and word in norm_name:
+                return float(cap)
+    return float(min(caps))
+
+
+def lock_in_alloted_vehicles(dispatch_df, fleet_status_df, veh_block_tons, buffer=1.0,
+                              max_tonnage=None, db_capacity_df=None):
+    """
+    For every row whose Dispatch Status is "Alloted" but has no Assigned Vehicle yet, runs
+    the SAME real-vehicle matching engine (allocate_shipments_to_fleet) used everywhere
+    else in the app to pick the closest available tonnage, then locks that vehicle number
+    into the row. Vehicles already used by other Alloted/Dispatched rows are excluded from
+    the pool first, so nothing gets double-booked across shipments.
+
+    Idempotent and one-way: a row that already has an Assigned Vehicle is left completely
+    untouched here, no matter what else changes (buffer, fleet availability, a later
+    refresh) — that's what makes the lock permanent. Only "Pending" rows (handled
+    separately, live, elsewhere) are allowed to keep changing.
+    """
+    dispatch_df = dispatch_df.copy()
+    if dispatch_df.empty:
+        return dispatch_df
+
+    already_used = set(
+        dispatch_df.loc[
+            dispatch_df["Assigned Vehicle"].astype(str).str.strip() != "",
+            "Assigned Vehicle"
+        ].astype(str).str.strip().str.upper()
+    )
+    working_fleet = fleet_status_df
+    if already_used and working_fleet is not None and not working_fleet.empty:
+        working_fleet = working_fleet[
+            ~working_fleet["Vehicle Number"].astype(str).str.strip().str.upper().isin(already_used)
+        ].copy()
+
+    needs_vehicle = dispatch_df[
+        (dispatch_df["Dispatch Status"] == "Alloted") &
+        (dispatch_df["Assigned Vehicle"].astype(str).str.strip() == "")
+    ]
+    if needs_vehicle.empty:
+        return dispatch_df
+
+    for idx, row in needs_vehicle.iterrows():
+        load_tons = row.get("Total Load (Ton)")
+        distributor = row.get("Route / Distributor", "")
+        if pd.isna(load_tons) or load_tons <= 0:
+            continue
+
+        dist_cap = match_distributor_cap(distributor, db_capacity_df) if db_capacity_df is not None else None
+        if max_tonnage is not None and dist_cap is not None:
+            effective_cap = min(max_tonnage, dist_cap)
+        else:
+            effective_cap = dist_cap if dist_cap is not None else max_tonnage
+
+        result = allocate_shipments_to_fleet(
+            [load_tons], working_fleet, veh_block_tons, buffer=buffer,
+            max_tonnage=effective_cap, distributors=[distributor]
+        )
+        if result:
+            # A single small shipment may still return >1 truck (e.g. an oversized load) —
+            # lock in the first (primary) vehicle; extra trucks, if any, are rare for a
+            # single-distributor "Alloted" row but are preserved in the Truck Size note.
+            vehicle_number = result[0]["Vehicle Number"]
+            dispatch_df.loc[idx, "Assigned Vehicle"] = vehicle_number
+            if vehicle_number != "(market)" and working_fleet is not None and not working_fleet.empty:
+                working_fleet = working_fleet[
+                    working_fleet["Vehicle Number"].astype(str).str.strip().str.upper() != vehicle_number
+                ].copy()
+    return dispatch_df
+
+
+def sync_dispatch_to_gate_out(dispatch_df, gate_out_df, veh_db, as_of_date):
+    """
+    Ensures every "Dispatched" row with an Assigned Vehicle has a matching Gate-Out Log
+    entry — the automatic gate-out trigger. Idempotent: safe to call on every rerun, never
+    creates a duplicate for the same (vehicle, distributor) pair, and never touches an
+    existing entry's Gate Out Date once set — so it stays locked to whenever that row was
+    first detected as Dispatched, not whatever the "as of date" happens to be later.
+    """
+    gate_out_df = gate_out_df.copy()
+    if dispatch_df is None or dispatch_df.empty:
+        return gate_out_df
+
+    veh_lookup = {}
+    if veh_db is not None and not veh_db.empty:
+        for _, v in veh_db.iterrows():
+            vnum = str(v.get("Vehicle Number", "")).strip().upper()
+            if vnum:
+                veh_lookup[vnum] = v
+
+    existing_keys = set()
+    if not gate_out_df.empty:
+        existing_keys = set(zip(
+            gate_out_df["Vehicle Number"].astype(str).str.strip().str.upper(),
+            gate_out_df["Route / Distributor"].astype(str).str.strip()
+        ))
+
+    dispatched = dispatch_df[
+        (dispatch_df["Dispatch Status"] == "Dispatched") &
+        (dispatch_df["Assigned Vehicle"].astype(str).str.strip() != "") &
+        (dispatch_df["Assigned Vehicle"].astype(str).str.strip().str.upper() != "(MARKET)")
+    ]
+
+    new_rows = []
+    for _, row in dispatched.iterrows():
+        vnum = str(row["Assigned Vehicle"]).strip().upper()
+        dist = str(row.get("Route / Distributor", "")).strip()
+        key = (vnum, dist)
+        if key in existing_keys:
+            continue
+        veh_info = veh_lookup.get(vnum)
+        ownership = str(veh_info.get("OwnershipType", "Spot Hire")).strip().title() if veh_info is not None else "Spot Hire"
+        tonnage = veh_info.get("CapacityTonnage") if veh_info is not None else None
+        new_rows.append({
+            "Vehicle Number": vnum,
+            "Ownership": ownership,
+            "Capacity Tonnage": tonnage,
+            "Gate Out Date": as_of_date,
+            "Actual Return Date": pd.NaT,
+            "Route / Distributor": dist,
+        })
+        existing_keys.add(key)
+
+    if new_rows:
+        gate_out_df = pd.concat([gate_out_df, pd.DataFrame(new_rows)], ignore_index=True)
+    return gate_out_df
