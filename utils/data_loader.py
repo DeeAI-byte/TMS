@@ -7,6 +7,7 @@ here, so numbers stay consistent across pages.
 """
 
 import os
+import re
 import math
 import itertools
 import numpy as np
@@ -16,6 +17,17 @@ import streamlit as st
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 LOCATIONS_FILE = os.path.join(DATA_DIR, "locations.xlsx")
 CAPACITY_FILE = os.path.join(DATA_DIR, "Distributor_wise_Max_Vehicle_Capacity.xlsx")
+
+LOCAL_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_data")
+GATE_OUT_LOG_PATH = os.path.join(LOCAL_DATA_DIR, "gate_out_log.csv")
+VEHICLE_STATUS_OVERRIDES_PATH = os.path.join(LOCAL_DATA_DIR, "vehicle_status_overrides.csv")
+
+GATE_OUT_LOG_COLUMNS = [
+    "Vehicle Number", "Ownership", "Truck Size (T)", "Gate Out Date",
+    "Actual Return Date", "Route / Distributor"
+]
+VEHICLE_STATUS_COLUMNS = ["Vehicle Number", "Remarks"]
+REMARKS_OPTIONS = ["Operational", "Non-Operational", "Maintenance", "Driver Not Available"]
 
 MONTH_COLS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUNE", "JULY", "AUGUST",
               "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"]
@@ -58,6 +70,31 @@ def load_db_capacity():
         "Max Capacity Vehicle": "MaxVehicleTonnage",
     })
     return raw.reset_index(drop=True)
+
+
+def get_distributor_list():
+    """Sorted list of real distributor names from the DB capacity master list — the single
+    source of truth for any dropdown where a distributor needs to be entered/selected
+    anywhere in the app (instead of free-typed 'Route' text)."""
+    cap = load_db_capacity()
+    return sorted(cap["Distributor"].dropna().astype(str).str.strip().unique().tolist())
+
+
+def unmatched_distributor_names(names):
+    """Given an iterable of distributor names (e.g. from an external Google Sheet), returns
+    the sorted set of ones that don't match the master DB capacity list (case/whitespace-
+    insensitive) — used to flag naming drift the transport office should fix at the source."""
+    cap = load_db_capacity()
+    master = set(cap["Distributor"].dropna().astype(str).str.strip().str.casefold())
+    out = set()
+    for n in names:
+        if n is None:
+            continue
+        s = str(n).strip()
+        if not s or s.casefold() in master:
+            continue
+        out.add(s)
+    return sorted(out)
 
 
 # --------------------------------------------------------------------------------------
@@ -460,6 +497,119 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
 
 
 # --------------------------------------------------------------------------------------
+# LOCAL "VEHICLE OUT" GATE-OUT LOG — auto-populated the moment a vehicle is allotted in
+# Today's Load (Live Fleet Tracker page), so the transport office no longer has to
+# duplicate that entry into a separate Google Sheet by hand. Still fully editable in the
+# app afterwards (Actual Return Date, Ownership) — same model as the old manual entry
+# table, just seeded automatically instead of starting blank every day.
+# --------------------------------------------------------------------------------------
+def load_gate_out_log_local():
+    """Loads the persisted Vehicle Out log from local storage, creating an empty one
+    (with the right columns) if it doesn't exist yet."""
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    if os.path.exists(GATE_OUT_LOG_PATH):
+        try:
+            df = pd.read_csv(GATE_OUT_LOG_PATH, dtype=str).fillna("")
+            for c in GATE_OUT_LOG_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[GATE_OUT_LOG_COLUMNS].reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=GATE_OUT_LOG_COLUMNS)
+
+
+def save_gate_out_log_local(df):
+    """Overwrites the local Vehicle Out log with the given (already-edited) dataframe."""
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    df = df.copy()
+    for c in GATE_OUT_LOG_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df[GATE_OUT_LOG_COLUMNS].to_csv(GATE_OUT_LOG_PATH, index=False)
+
+
+def append_gate_out_entries(new_rows_df, dedupe=True):
+    """Appends newly-allotted vehicles (from Today's Load, or an imported sheet) to the
+    local Vehicle Out log and persists it. Returns the combined dataframe. Exact-duplicate
+    rows (same vehicle/ownership/size/dates/distributor) are dropped by default so
+    re-clicking Confirm or Import doesn't double-log the same gate-out."""
+    current = load_gate_out_log_local()
+    new_rows_df = new_rows_df.copy()
+    for c in GATE_OUT_LOG_COLUMNS:
+        if c not in new_rows_df.columns:
+            new_rows_df[c] = ""
+    combined = pd.concat([current, new_rows_df[GATE_OUT_LOG_COLUMNS]], ignore_index=True)
+    if dedupe:
+        combined = combined.drop_duplicates(keep="first").reset_index(drop=True)
+    save_gate_out_log_local(combined)
+    return combined
+
+
+# --------------------------------------------------------------------------------------
+# IN-APP VEHICLE STATUS OVERRIDES — lets the transport office flip a vehicle's Remarks
+# (Operational / Non-Operational / Maintenance / Driver Not Available) from a dropdown in
+# the app instead of editing the source Vehicle Database Excel every time. Overrides are
+# layered on top of whatever the Excel says, keyed by Vehicle Number.
+# --------------------------------------------------------------------------------------
+def normalize_remarks_label(value):
+    """Maps free-text Remarks (however the source Excel spells them, e.g. 'Driver not
+    avaialble', 'Vehicle Breakdown') onto one of the four canonical dropdown labels."""
+    v = str(value).strip().lower()
+    if not v or v in ("nan", "none"):
+        return "Non-Operational"
+    if re.search(r'(?:non|not)[\s-]*operational', v):
+        return "Non-Operational"
+    if "operational" in v:
+        return "Operational"
+    if "driver" in v:
+        return "Driver Not Available"
+    if "breakdown" in v or "maintenance" in v or "repair" in v:
+        return "Maintenance"
+    return "Non-Operational"
+
+
+def load_vehicle_status_overrides():
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    if os.path.exists(VEHICLE_STATUS_OVERRIDES_PATH):
+        try:
+            df = pd.read_csv(VEHICLE_STATUS_OVERRIDES_PATH, dtype=str).fillna("")
+            for c in VEHICLE_STATUS_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[VEHICLE_STATUS_COLUMNS].reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=VEHICLE_STATUS_COLUMNS)
+
+
+def save_vehicle_status_overrides(df):
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    df = df.copy()
+    df["Vehicle Number"] = df["Vehicle Number"].astype(str).str.strip().str.upper()
+    df = df.drop_duplicates(subset=["Vehicle Number"], keep="last")
+    df[VEHICLE_STATUS_COLUMNS].to_csv(VEHICLE_STATUS_OVERRIDES_PATH, index=False)
+
+
+def apply_vehicle_status_overrides(veh_db, overrides_df):
+    """Layers saved in-app status overrides on top of the Vehicle Database's own Remarks
+    column (Excel stays the fallback/default; an override, once saved, wins)."""
+    veh = veh_db.copy()
+    veh["Vehicle Number"] = veh["Vehicle Number"].astype(str).str.strip().str.upper()
+    if "Remarks" not in veh.columns:
+        veh["Remarks"] = ""
+    veh["Remarks"] = veh["Remarks"].apply(normalize_remarks_label)
+    if overrides_df is not None and not overrides_df.empty:
+        ov = overrides_df.copy()
+        ov["Vehicle Number"] = ov["Vehicle Number"].astype(str).str.strip().str.upper()
+        ov_map = dict(zip(ov["Vehicle Number"], ov["Remarks"]))
+        veh["Remarks"] = veh.apply(
+            lambda r: ov_map.get(r["Vehicle Number"], r["Remarks"]), axis=1
+        )
+    return veh
+
+
+# --------------------------------------------------------------------------------------
 # LIVE FLEET TRACKER — process a gate-out log (e.g. from a Google Sheet) into
 # currently-out / available counts, for real intraday spot-hire planning.
 # --------------------------------------------------------------------------------------
@@ -565,13 +715,13 @@ def already_dispatched_routes(log_df, as_of_date):
 def validate_ownership_values(df):
     """
     Returns the set of distinct 'Ownership' values in the log that DON'T match
-    'Own' or 'Fixed' (case-insensitive) — a common data-entry mistake (e.g. someone
-    typing the column header 'Ownership' into the cells instead of an actual value).
+    'Own', 'Fixed', or 'Spot Hire' (case-insensitive) — a common data-entry mistake (e.g.
+    someone typing the column header 'Ownership' into the cells instead of an actual value).
     """
     if df is None or df.empty or "Ownership" not in df.columns:
         return []
     vals = df["Ownership"].astype(str).str.strip().str.title().unique().tolist()
-    return [v for v in vals if v not in ("Own", "Fixed")]
+    return [v for v in vals if v not in ("Own", "Fixed", "Spot Hire")]
 
 
 def _operational_mask(remarks_series, remarks_col_present):
