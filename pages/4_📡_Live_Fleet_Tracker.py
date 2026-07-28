@@ -174,70 +174,10 @@ def filter_daily_load_rows(load_log_df, planning_date):
 
 
 # ---------------- LOAD LOCAL "VEHICLE OUT" LOG (single source of truth, no sheet dependency) ----------------
+# The editable table itself now lives further down, next to Available Vehicles — this just
+# loads the persisted data so the allocation/cross-reference logic below has it to work with.
 base_log_df = load_gate_out_log_local()
-
-st.write("---")
-st.subheader("🚚 Vehicle Out — Gate-Out / Return Log")
-st.caption(
-    "Fills in automatically as soon as you move a shipment to **Dispatched** in Today's Load "
-    "below (Vehicle Number, Ownership, Truck Size, Gate Out Date, Distributor — including Spot "
-    "Hire, shown as **market** in Vehicle Number). Edit **Actual Return Date** once a truck is "
-    "back, or fix **Ownership** — this is the one and only Vehicle Out table; no Google Sheet "
-    "involved anymore."
-)
-
-with st.expander("📤 One-time: bring in old gate-out data from your previous Google Sheet"):
-    st.caption(
-        "Download your old gate-out sheet as CSV (File → Download → Comma Separated Values) and "
-        "upload it here once — it'll be copied permanently into this table below, matched by "
-        "column name (Vehicle Number, Ownership, Gate Out Date, Actual Return Date, Route / "
-        "Distributor). After this you can delete the old sheet; the app no longer reads from it."
-    )
-    migrate_file = st.file_uploader("Old gate-out sheet (CSV)", type=["csv"], key="migrate_gate_out_upload")
-    if migrate_file is not None:
-        try:
-            migrate_df = pd.read_csv(migrate_file)
-            migrate_df.columns = [str(c).strip() for c in migrate_df.columns]
-            migrate_df = migrate_df.replace(r'^\s*$', pd.NA, regex=True).dropna(how="all")
-            for c in GATE_OUT_LOG_COLUMNS:
-                if c not in migrate_df.columns:
-                    migrate_df[c] = ""
-            st.dataframe(migrate_df[GATE_OUT_LOG_COLUMNS].head(10), use_container_width=True, hide_index=True)
-            if st.button(f"📥 Import these {len(migrate_df)} row(s) into the Vehicle Out log", key="migrate_import_btn"):
-                append_gate_out_entries(migrate_df[GATE_OUT_LOG_COLUMNS])
-                st.success("Imported — scroll down to see them in the Vehicle Out table.")
-                st.rerun()
-        except Exception as e:
-            st.error(f"⚠️ Couldn't read that file ({e}).")
-
-log_distributor_options = sorted(set(distributor_list) | {""} | set(
-    str(v).strip() for v in base_log_df["Route / Distributor"].dropna() if str(v).strip()
-))
-edited_log_df = st.data_editor(
-    base_log_df, num_rows="dynamic", use_container_width=True, key="gate_out_log_editor",
-    column_config={
-        "Ownership": st.column_config.SelectboxColumn(options=["Own", "Fixed", "Spot Hire"]),
-        "Gate Out Date": st.column_config.TextColumn(help="e.g. 2026-07-27"),
-        "Actual Return Date": st.column_config.TextColumn(help="Leave blank until it's back"),
-        "Route / Distributor": st.column_config.SelectboxColumn(options=log_distributor_options),
-    }
-)
-save_col1, save_col2 = st.columns([1, 4])
-with save_col1:
-    if st.button("💾 Save log changes", use_container_width=True, key="save_gate_log_btn"):
-        save_gate_out_log_local(edited_log_df)
-        st.success("Saved.")
-        st.rerun()
-with save_col2:
-    st.caption("⚠️ Saved locally on this deployment (may reset on redeploy) — download the table below "
-               "any time you'd like an offline copy.")
-st.download_button(
-    "⬇️ Download Vehicle Out log (CSV)",
-    edited_log_df.to_csv(index=False).encode("utf-8"),
-    file_name=f"vehicle_out_log_{as_of_date}.csv", mime="text/csv"
-)
-
-log_df = edited_log_df
+log_df = base_log_df
 
 # ---------------- PROCESS LOG + CROSS-REFERENCE ----------------
 required_cols = {"Vehicle Number", "Ownership", "Gate Out Date"}
@@ -736,6 +676,7 @@ with st.container(border=True):
                         "Vehicle Number": row["Vehicle Number"], "Ownership": row["Source"],
                         "Truck Size (T)": row["Truck Size"], "Gate Out Date": today_str,
                         "Actual Return Date": "", "Route / Distributor": row["Distributor"],
+                        "Load (Ton)": row["Load (Ton)"],
                     })
 
             if revert_keys:
@@ -792,20 +733,72 @@ with c1:
                         file_name=f"available_vehicles_{as_of_date}.csv", mime="text/csv")
 
 with c2:
-    st.subheader("🚫 Vehicles Currently Out")
-    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "CapacityTonnage", "Distributor", "Days Out", "Remarks"]
-                if c in fleet_status_df.columns]
-    out_show = fleet_status_df[fleet_status_df["Status"] == "Out"][out_cols].copy()
-    if "CapacityTonnage" in out_show.columns:
-        out_show["Truck Size"] = out_show["CapacityTonnage"].apply(format_truck_size)
-        out_show = out_show.drop(columns=["CapacityTonnage"])
-    if "Distributor" in out_show.columns:
-        out_show["Distributor"] = out_show["Distributor"].fillna("—")
-    if "Remarks" in out_show.columns:
-        out_show["Remarks"] = out_show["Remarks"].replace("", "—")
-    if "Days Out" in out_show.columns:
-        out_show = out_show.sort_values("Days Out", ascending=False)
-    st.dataframe(out_show, use_container_width=True, height=320, hide_index=True)
+    st.subheader("🚚 Vehicle Out — Gate-Out / Return Log")
+    st.caption(
+        "Fills in automatically as soon as you move a shipment to **Dispatched** in Today's Load "
+        "above. Edit **Return Date** (calendar) once a truck is back, or fix **Ownership** — this "
+        "is the one and only Vehicle Out table."
+    )
+
+    with st.expander("📤 One-time: bring in old gate-out data from your previous Google Sheet"):
+        st.caption(
+            "Download your old gate-out sheet as CSV (File → Download → Comma Separated Values) and "
+            "upload it here once — it'll be copied permanently into this table below, matched by "
+            "column name. After this you can delete the old sheet; the app no longer reads from it."
+        )
+        migrate_file = st.file_uploader("Old gate-out sheet (CSV)", type=["csv"], key="migrate_gate_out_upload")
+        if migrate_file is not None:
+            try:
+                migrate_df = pd.read_csv(migrate_file)
+                migrate_df.columns = [str(c).strip() for c in migrate_df.columns]
+                migrate_df = migrate_df.replace(r'^\s*$', pd.NA, regex=True).dropna(how="all")
+                for c in GATE_OUT_LOG_COLUMNS:
+                    if c not in migrate_df.columns:
+                        migrate_df[c] = ""
+                st.dataframe(migrate_df[GATE_OUT_LOG_COLUMNS].head(10), use_container_width=True, hide_index=True)
+                if st.button(f"📥 Import these {len(migrate_df)} row(s) into the Vehicle Out log", key="migrate_import_btn"):
+                    append_gate_out_entries(migrate_df[GATE_OUT_LOG_COLUMNS])
+                    st.success("Imported — see them in the table below.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"⚠️ Couldn't read that file ({e}).")
+
+    log_distributor_options = sorted(set(distributor_list) | {""} | set(
+        str(v).strip() for v in base_log_df["Route / Distributor"].dropna() if str(v).strip()
+    ))
+    # Real calendar pickers need actual date values, not text — blank cells become NaT
+    # (shown as an empty, pickable calendar field) rather than an unparsed string.
+    display_log_df = base_log_df.copy()
+    display_log_df["Gate Out Date"] = pd.to_datetime(display_log_df["Gate Out Date"], errors="coerce")
+    display_log_df["Actual Return Date"] = pd.to_datetime(display_log_df["Actual Return Date"], errors="coerce")
+    display_log_df["Load (Ton)"] = pd.to_numeric(display_log_df["Load (Ton)"], errors="coerce")
+
+    edited_log_df = st.data_editor(
+        display_log_df, num_rows="dynamic", use_container_width=True, height=320, key="gate_out_log_editor",
+        column_order=["Vehicle Number", "Ownership", "Truck Size (T)", "Gate Out Date",
+                      "Actual Return Date", "Route / Distributor", "Load (Ton)"],
+        column_config={
+            "Ownership": st.column_config.SelectboxColumn(options=["Own", "Fixed", "Spot Hire"]),
+            "Truck Size (T)": st.column_config.TextColumn(label="Truck Size"),
+            "Gate Out Date": st.column_config.DateColumn(label="Gate Out", format="DD-MM-YYYY"),
+            "Actual Return Date": st.column_config.DateColumn(label="Return Date", format="DD-MM-YYYY"),
+            "Route / Distributor": st.column_config.SelectboxColumn(label="Distributor", options=log_distributor_options),
+            "Load (Ton)": st.column_config.NumberColumn(label="Load (Ton)", format="%.1f"),
+        }
+    )
+    save_col1, save_col2 = st.columns([1, 3])
+    with save_col1:
+        if st.button("💾 Save log changes", use_container_width=True, key="save_gate_log_btn"):
+            to_save = edited_log_df.copy()
+            to_save["Gate Out Date"] = pd.to_datetime(to_save["Gate Out Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+            to_save["Actual Return Date"] = pd.to_datetime(to_save["Actual Return Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+            save_gate_out_log_local(to_save)
+            st.success("Saved.")
+            st.rerun()
+    with save_col2:
+        st.caption("⚠️ Saved locally on this deployment (may reset on redeploy).")
+    st.download_button("⬇️ Download Vehicle Out log (CSV)", edited_log_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"vehicle_out_log_{as_of_date}.csv", mime="text/csv")
 
 with st.expander("ℹ️ How this works"):
     st.markdown("""

@@ -24,7 +24,7 @@ VEHICLE_STATUS_OVERRIDES_PATH = os.path.join(LOCAL_DATA_DIR, "vehicle_status_ove
 
 GATE_OUT_LOG_COLUMNS = [
     "Vehicle Number", "Ownership", "Truck Size (T)", "Gate Out Date",
-    "Actual Return Date", "Route / Distributor"
+    "Actual Return Date", "Route / Distributor", "Load (Ton)"
 ]
 VEHICLE_STATUS_COLUMNS = ["Vehicle Number", "Remarks"]
 REMARKS_OPTIONS = ["Operational", "Non-Operational", "Maintenance", "Driver Not Available"]
