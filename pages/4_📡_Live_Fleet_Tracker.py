@@ -12,7 +12,12 @@ from utils.data_loader import (
     load_vehicle_database, fleet_totals_by_ownership, load_assumptions,
     process_gate_out_log, cross_reference_fleet, validate_ownership_values,
     allocate_trucks_by_tonnage, allocate_shipments_to_fleet, already_dispatched_routes,
-    load_db_capacity
+    load_db_capacity, load_gate_out_log_local, save_gate_out_log_local,
+    append_gate_out_entries, load_vehicle_status_overrides, save_vehicle_status_overrides,
+    apply_vehicle_status_overrides, REMARKS_OPTIONS, GATE_OUT_LOG_COLUMNS,
+    get_distributor_list, unmatched_distributor_names, format_truck_size,
+    load_allocation_state, save_allocation_state, upsert_allocation_state,
+    ALLOCATION_STATUS_OPTIONS
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -25,51 +30,23 @@ st.write("---")
 
 try:
     veh_db = load_vehicle_database()
+    status_overrides_df = load_vehicle_status_overrides()
+    veh_db = apply_vehicle_status_overrides(veh_db, status_overrides_df)
     own_total_default, fixed_total_default = fleet_totals_by_ownership(veh_db)
     veh_block, _ = load_assumptions()
     default_truck_capacity = int(round(veh_block["Capacity"].mean())) if len(veh_block) else 700
+    distributor_list = get_distributor_list()
 except Exception as e:
     st.error(f"⚠️ Could not load vehicle database: {e}")
     st.stop()
 
 # ---------------- SIDEBAR CONFIG ----------------
-st.sidebar.header("🔗 Gate-Out Log Source")
-
-DEFAULT_GATE_OUT_SHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vT_DAK4PWeK2FILTKwXEpPkMMUIcj1cQ41e62bM4754358aoCNvDwxEP_RYLeihRB1A_3k3nXIB_wm7/pub?gid=0&single=true&output=csv"
-
-sheet_url = st.sidebar.text_input(
-    "Google Sheet CSV link",
-    value=DEFAULT_GATE_OUT_SHEET_URL,
-    placeholder="https://docs.google.com/spreadsheets/d/.../export?format=csv",
-    help="Publish your sheet as CSV: File → Share → Publish to web → select the sheet → CSV format → copy link. "
-         "Pre-filled with your default sheet — change it here if you ever need a different one.",
-    key="live_gate_sheet_url"
+st.sidebar.header("🔗 Vehicle Out (Gate-Out Log)")
+st.sidebar.caption(
+    "Fills in automatically as you move shipments to **Dispatched** in Today's Load below — "
+    "one single table, no separate Google Sheet needed anymore."
 )
 as_of_date = st.sidebar.date_input("As of date", value=date.today(), key="live_as_of_date")
-refresh = st.sidebar.button("🔄 Refresh Now", use_container_width=True)
-
-with st.sidebar.expander("📋 Required gate-out log columns"):
-    st.markdown("""
-    - **Vehicle Number** — must match your Vehicle Database
-    - **Ownership** — `Own` or `Fixed`
-    - **Gate Out Date**
-    - **Actual Return Date** — leave blank until it's back
-    - **Route / Distributor** (optional)
-    """)
-    template = pd.DataFrame({
-        "Vehicle Number": [veh_db.iloc[0]["Vehicle Number"] if len(veh_db) else "UP32AB1234",
-                           veh_db.iloc[1]["Vehicle Number"] if len(veh_db) > 1 else "UP32CD5678"],
-        "Ownership": ["Own", "Fixed"],
-        "Gate Out Date": [str(date.today()), str(date.today())],
-        "Actual Return Date": ["", ""],
-        "Route / Distributor": ["", ""],
-    })
-    st.download_button(
-        "⬇️ Download sheet template (CSV)",
-        template.to_csv(index=False).encode("utf-8"),
-        file_name="gate_out_log_template.csv",
-        mime="text/csv"
-    )
 
 st.sidebar.write("---")
 st.sidebar.header("📦 Today's Load")
@@ -115,11 +92,7 @@ max_tonnage_live = st.sidebar.number_input(
     help="Leave at 0 for no cap — uses the largest size in the table above if needed."
 )
 
-# ---------------- LOAD GATE-OUT LOG ----------------
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_gate_out_sheet(url):
-    return pd.read_csv(url)
-
+# ---------------- LOAD LOG SHEET FETCH ----------------
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_load_sheet(url):
     return pd.read_csv(url)
@@ -200,65 +173,71 @@ def filter_daily_load_rows(load_log_df, planning_date):
     return daily_rows[["Route / Distributor", "Load (Ton)", "Status"]].reset_index(drop=True)
 
 
-log_df = None
-data_source_label = None
+# ---------------- LOAD LOCAL "VEHICLE OUT" LOG (single source of truth, no sheet dependency) ----------------
+base_log_df = load_gate_out_log_local()
 
-if sheet_url:
-    if refresh:
-        fetch_gate_out_sheet.clear()
-    try:
-        log_df = fetch_gate_out_sheet(sheet_url)
-        if log_df is not None and not log_df.empty:
-            # Treat rows that are completely blank or whitespace-only as missing data,
-            # so an empty Google Sheet with only headers doesn't produce phantom out vehicles.
-            log_df = log_df.replace(r'^\s*$', pd.NA, regex=True)
-            log_df = log_df.dropna(how="all")
-        data_source_label = "🟢 Live — Google Sheet"
-    except Exception as e:
-        st.error(
-            f"⚠️ Couldn't read that sheet ({e}). Make sure it's **published to the web as CSV** "
-            f"(File → Share → Publish to web → CSV) and the link is the export CSV link. "
-            f"Using manual entry below in the meantime."
-        )
+st.write("---")
+st.subheader("🚚 Vehicle Out — Gate-Out / Return Log")
+st.caption(
+    "Fills in automatically as soon as you move a shipment to **Dispatched** in Today's Load "
+    "below (Vehicle Number, Ownership, Truck Size, Gate Out Date, Distributor — including Spot "
+    "Hire, shown as **market** in Vehicle Number). Edit **Actual Return Date** once a truck is "
+    "back, or fix **Ownership** — this is the one and only Vehicle Out table; no Google Sheet "
+    "involved anymore."
+)
 
-LOCAL_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "local_data")
-LOCAL_LOG_PATH = os.path.join(LOCAL_LOG_DIR, "manual_gate_out_log.csv")
-
-if log_df is None:
-    st.info("💡 No Google Sheet connected yet — enter today's gate-outs manually below (saved locally so "
-             "it's remembered day to day), or add a sheet link in the sidebar for the more reliable option.")
-    data_source_label = "🟡 Manual entry (locally saved)"
-    if "manual_log_df" not in st.session_state:
-        if os.path.exists(LOCAL_LOG_PATH):
-            try:
-                st.session_state.manual_log_df = pd.read_csv(LOCAL_LOG_PATH)
-            except Exception:
-                st.session_state.manual_log_df = pd.DataFrame({
-                    "Vehicle Number": [], "Ownership": [], "Gate Out Date": [],
-                    "Actual Return Date": [], "Route / Distributor": []
-                })
-        else:
-            st.session_state.manual_log_df = pd.DataFrame({
-                "Vehicle Number": [], "Ownership": [], "Gate Out Date": [],
-            "Actual Return Date": [], "Route / Distributor": []
-            })
-    log_df = st.data_editor(
-        st.session_state.manual_log_df, num_rows="dynamic", use_container_width=True,
-        key="manual_log_editor",
-        column_config={"Ownership": st.column_config.SelectboxColumn(options=["Own", "Fixed"])}
+with st.expander("📤 One-time: bring in old gate-out data from your previous Google Sheet"):
+    st.caption(
+        "Download your old gate-out sheet as CSV (File → Download → Comma Separated Values) and "
+        "upload it here once — it'll be copied permanently into this table below, matched by "
+        "column name (Vehicle Number, Ownership, Gate Out Date, Actual Return Date, Route / "
+        "Distributor). After this you can delete the old sheet; the app no longer reads from it."
     )
-    save_col1, save_col2 = st.columns([1, 4])
-    with save_col1:
-        if st.button("💾 Save entries", use_container_width=True):
-            os.makedirs(LOCAL_LOG_DIR, exist_ok=True)
-            log_df.to_csv(LOCAL_LOG_PATH, index=False)
-            st.session_state.manual_log_df = log_df
-            st.success("Saved — this will be remembered next time you open this page.")
-    with save_col2:
-        st.caption("⚠️ Locally saved entries persist across page visits on this deployment, but may reset "
-                   "if the app restarts/redeploys. A Google Sheet is the more durable option for daily use.")
+    migrate_file = st.file_uploader("Old gate-out sheet (CSV)", type=["csv"], key="migrate_gate_out_upload")
+    if migrate_file is not None:
+        try:
+            migrate_df = pd.read_csv(migrate_file)
+            migrate_df.columns = [str(c).strip() for c in migrate_df.columns]
+            migrate_df = migrate_df.replace(r'^\s*$', pd.NA, regex=True).dropna(how="all")
+            for c in GATE_OUT_LOG_COLUMNS:
+                if c not in migrate_df.columns:
+                    migrate_df[c] = ""
+            st.dataframe(migrate_df[GATE_OUT_LOG_COLUMNS].head(10), use_container_width=True, hide_index=True)
+            if st.button(f"📥 Import these {len(migrate_df)} row(s) into the Vehicle Out log", key="migrate_import_btn"):
+                append_gate_out_entries(migrate_df[GATE_OUT_LOG_COLUMNS])
+                st.success("Imported — scroll down to see them in the Vehicle Out table.")
+                st.rerun()
+        except Exception as e:
+            st.error(f"⚠️ Couldn't read that file ({e}).")
 
-st.caption(f"Gate-out data source: **{data_source_label}**" + (" — refreshes automatically every 60s" if sheet_url else ""))
+log_distributor_options = sorted(set(distributor_list) | {""} | set(
+    str(v).strip() for v in base_log_df["Route / Distributor"].dropna() if str(v).strip()
+))
+edited_log_df = st.data_editor(
+    base_log_df, num_rows="dynamic", use_container_width=True, key="gate_out_log_editor",
+    column_config={
+        "Ownership": st.column_config.SelectboxColumn(options=["Own", "Fixed", "Spot Hire"]),
+        "Gate Out Date": st.column_config.TextColumn(help="e.g. 2026-07-27"),
+        "Actual Return Date": st.column_config.TextColumn(help="Leave blank until it's back"),
+        "Route / Distributor": st.column_config.SelectboxColumn(options=log_distributor_options),
+    }
+)
+save_col1, save_col2 = st.columns([1, 4])
+with save_col1:
+    if st.button("💾 Save log changes", use_container_width=True, key="save_gate_log_btn"):
+        save_gate_out_log_local(edited_log_df)
+        st.success("Saved.")
+        st.rerun()
+with save_col2:
+    st.caption("⚠️ Saved locally on this deployment (may reset on redeploy) — download the table below "
+               "any time you'd like an offline copy.")
+st.download_button(
+    "⬇️ Download Vehicle Out log (CSV)",
+    edited_log_df.to_csv(index=False).encode("utf-8"),
+    file_name=f"vehicle_out_log_{as_of_date}.csv", mime="text/csv"
+)
+
+log_df = edited_log_df
 
 # ---------------- PROCESS LOG + CROSS-REFERENCE ----------------
 required_cols = {"Vehicle Number", "Ownership", "Gate Out Date"}
@@ -270,11 +249,15 @@ if has_log_data:
     if bad_ownership_values:
         st.error(
             f"🚫 **Data problem in your sheet's Ownership column:** found value(s) {bad_ownership_values} "
-            f"that aren't **Own** or **Fixed**. Those rows won't count toward availability until fixed — "
-            f"a common mistake is typing the column header text into the cells by accident. Please correct "
-            f"the Ownership column in your Google Sheet to say exactly `Own` or `Fixed`."
+            f"that aren't **Own**, **Fixed**, or **Spot Hire**. Those rows won't count toward availability "
+            f"until fixed — a common mistake is typing the column header text into the cells by accident. "
+            f"Please correct the Ownership column to say exactly `Own`, `Fixed`, or `Spot Hire`."
         )
-    processed_df, currently_out_df = process_gate_out_log(log_df, as_of_date)
+    # Spot Hire rows are logged for the record (they show in the Vehicle Out table above) but
+    # aren't real registered vehicles, so they're excluded here — cross-referencing them against
+    # the Vehicle Database would otherwise flag every "(market)" row as an unmatched typo.
+    fleet_log_df = log_df[log_df["Ownership"].astype(str).str.strip().str.title() != "Spot Hire"].copy()
+    processed_df, currently_out_df = process_gate_out_log(fleet_log_df, as_of_date)
 else:
     currently_out_df = pd.DataFrame(columns=["Vehicle Number", "Ownership", "Days Out"])
     st.info("ℹ️ No gate-out entries yet — showing full fleet as available.")
@@ -383,7 +366,7 @@ if has_log_data:
     trend_rows = []
     for i in range(trend_days - 1, -1, -1):
         d = as_of_date - pd.Timedelta(days=i)
-        _, out_d = process_gate_out_log(log_df, d)
+        _, out_d = process_gate_out_log(fleet_log_df, d)
         status_d, _ = cross_reference_fleet(veh_db, out_d)
         own_avail_d = len(status_d[(status_d["OwnershipType"] == "Own") & (status_d["Status"] == "Available")])
         fixed_avail_d = len(status_d[(status_d["OwnershipType"] == "Fixed") & (status_d["Status"] == "Available")])
@@ -421,6 +404,13 @@ if load_sheet_url:
 
 st.header(f"📦 Live Load Status — {as_of_date.strftime('%d %b %Y')}")
 if _summary_shipments_df is not None and not _summary_shipments_df.empty:
+    _bad_dist_names = unmatched_distributor_names(_summary_shipments_df["Route / Distributor"])
+    if _bad_dist_names:
+        st.warning(
+            f"⚠️ **{len(_bad_dist_names)} distributor name(s) in the Load Log sheet don't match your "
+            f"master distributor list** — their max-vehicle-tonnage cap won't apply until fixed at the "
+            f"source: {', '.join(_bad_dist_names[:10])}" + (", …" if len(_bad_dist_names) > 10 else "")
+        )
     _load_numeric = pd.to_numeric(_summary_shipments_df["Load (Ton)"], errors="coerce").fillna(0)
     _total_orders = len(_summary_shipments_df)
     _total_load = round(float(_load_numeric.sum()), 1)
@@ -526,10 +516,17 @@ with st.container(border=True):
             st.session_state.fallback_shipments_df = pd.DataFrame({
                 "Route / Distributor": [""], "Load (Ton)": [0.0]
             })
+        fallback_options = sorted(set(distributor_list) | {""} | set(
+            str(v).strip() for v in st.session_state.fallback_shipments_df["Route / Distributor"].dropna()
+            if str(v).strip()
+        ))
         shipments_df = st.data_editor(
             st.session_state.fallback_shipments_df, num_rows="dynamic", use_container_width=True,
             key="fallback_shipments_editor",
-            column_config={"Load (Ton)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f")}
+            column_config={
+                "Load (Ton)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+                "Route / Distributor": st.column_config.SelectboxColumn(options=fallback_options),
+            }
         )
         load_source_note = "manual fallback"
 
@@ -540,42 +537,47 @@ with st.container(border=True):
     if shipments_to_plan_df is not None and "Status" in shipments_to_plan_df.columns:
         shipments_to_plan_df = shipments_to_plan_df[shipments_to_plan_df["Status"] == "Pending"].copy()
 
-    # --- Recognize shipments already executed, even if Dispatch Status wasn't flipped ---
-    # shipments_to_plan_df above already excludes anything marked "Dispatched" in the Load
-    # Log. This second check catches the gap where the Transport Team has recorded the
-    # actual gate-out (Vehicle Number + date) in the gate-out log for a distributor, but
-    # hasn't (yet, or ever) updated that shipment's status cell in the separate Load Log
-    # sheet. Without this, that shipment would still look "Pending" and get re-planned
-    # against whatever vehicles are still free — recommending a DIFFERENT vehicle than the
-    # one that was actually just dispatched for it.
-    already_dispatched = already_dispatched_routes(log_df, as_of_date) if has_log_data else set()
-
-    excluded_rows = pd.DataFrame()
-    if shipments_to_plan_df is not None and not shipments_to_plan_df.empty and already_dispatched:
-        norm_route = shipments_to_plan_df["Route / Distributor"].astype(str).str.strip().str.casefold()
-        is_already_out = norm_route.isin(already_dispatched)
-        excluded_rows = shipments_to_plan_df[is_already_out]
-        shipments_to_plan_df = shipments_to_plan_df[~is_already_out].copy()
-
-    # Deterministic ordering: sort by the shipment's own content (mergesort — stable),
-    # not by whatever row order the source sheet happens to have. This guarantees the
-    # same set of pending shipments always allocates to the same vehicles, even if
-    # someone manually reorders/sorts rows in the Google Sheet without changing the
-    # actual data.
+    # Deterministic ordering + drop blank/zero loads FIRST, then build a stable ShipmentKey
+    # per row (Date|Distributor|Load|dup-seq) — this is what lets a shipment carry a
+    # Pending → Allotted → Dispatched status across reruns, and lets a duplicate shipment
+    # (same distributor + same tonnage, same day) still get its own independent key.
+    today_str = str(as_of_date)
     if shipments_to_plan_df is not None and not shipments_to_plan_df.empty:
+        shipments_to_plan_df = shipments_to_plan_df[
+            pd.to_numeric(shipments_to_plan_df["Load (Ton)"], errors="coerce") > 0
+        ].copy()
         shipments_to_plan_df = shipments_to_plan_df.sort_values(
             ["Route / Distributor", "Load (Ton)"], kind="mergesort"
         ).reset_index(drop=True)
-        # Keep loads/distributors/caps all aligned by filtering once, here, rather than
-        # filtering shipment_loads separately below (which previously could desync the
-        # two lists if a row had a blank/zero load).
-        shipments_to_plan_df = shipments_to_plan_df[
-            pd.to_numeric(shipments_to_plan_df["Load (Ton)"], errors="coerce") > 0
-        ].reset_index(drop=True)
+        _norm_dist = shipments_to_plan_df["Route / Distributor"].astype(str).str.strip()
+        _load_key = pd.to_numeric(shipments_to_plan_df["Load (Ton)"], errors="coerce").round(3).astype(str)
+        _dup_seq = shipments_to_plan_df.groupby([_norm_dist, _load_key]).cumcount().astype(str)
+        shipments_to_plan_df["ShipmentKey"] = today_str + "|" + _norm_dist + "|" + _load_key + "|" + _dup_seq
+    else:
+        shipments_to_plan_df = pd.DataFrame(columns=["Route / Distributor", "Load (Ton)", "ShipmentKey"])
 
-    shipment_loads = shipments_to_plan_df["Load (Ton)"].tolist() if shipments_to_plan_df is not None and not shipments_to_plan_df.empty else []
-    shipment_distributors = shipments_to_plan_df["Route / Distributor"].tolist() if shipments_to_plan_df is not None and not shipments_to_plan_df.empty else []
-    total_load_today = round(float(sum(shipment_loads)), 1)
+    # --- Recognize shipments already executed some OTHER way, even if Dispatch Status
+    # wasn't flipped here --- e.g. someone manually added a gate-out row for that
+    # distributor today without going through Allot/Dispatch below. Shipments we're
+    # ALREADY tracking via our own Pending/Allotted/Dispatched state are exempt from this
+    # heuristic — their real status comes from that state, not a guess.
+    alloc_state_all = load_allocation_state()
+    alloc_state_today = (
+        alloc_state_all[alloc_state_all["Date"] == today_str].copy()
+        if not alloc_state_all.empty else alloc_state_all
+    )
+    tracked_keys_today = set(alloc_state_today["ShipmentKey"]) if len(alloc_state_today) else set()
+
+    already_dispatched = already_dispatched_routes(log_df, as_of_date) if has_log_data else set()
+    excluded_rows = pd.DataFrame()
+    if not shipments_to_plan_df.empty and already_dispatched:
+        norm_route = shipments_to_plan_df["Route / Distributor"].astype(str).str.strip().str.casefold()
+        is_already_out = norm_route.isin(already_dispatched) & ~shipments_to_plan_df["ShipmentKey"].isin(tracked_keys_today)
+        excluded_rows = shipments_to_plan_df[is_already_out]
+        shipments_to_plan_df = shipments_to_plan_df[~is_already_out].copy()
+
+    shipment_distributors = shipments_to_plan_df["Route / Distributor"].tolist()
+    total_load_today = round(float(shipments_to_plan_df["Load (Ton)"].sum()), 1) if len(shipments_to_plan_df) else 0.0
 
     # Each distributor can only physically receive up to its own max allowed vehicle size
     # (road width, gate access, etc.) — from the Distributor-wise Max Vehicle Capacity
@@ -614,40 +616,89 @@ with st.container(border=True):
     veh_block_tons = veh_block_tons.dropna(subset=["TonnageNum"])
     veh_block_tons["Capacity"] = veh_block_tons["TonnageNum"]
 
-    alloc_results = allocate_shipments_to_fleet(
-        shipment_loads, fleet_status_df, veh_block_tons,
-        buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
-        distributors=shipment_distributors, max_tonnages=shipment_max_tonnages
+    PLAN_COLS = ["ShipmentKey", "Vehicle Number", "Truck Size", "Load (Ton)", "Source", "Distributor", "Status"]
+
+    # --- Shipments already Allotted or Dispatched today: pull their FIXED vehicle from
+    # the saved state — never recomputed, never reassigned to a different shipment.
+    locked_state = (
+        alloc_state_today[alloc_state_today["Status"].isin(["Allotted", "Dispatched"])]
+        if len(alloc_state_today) else alloc_state_today
     )
-    alloc_results_df = pd.DataFrame(alloc_results)
+    if len(locked_state):
+        locked_display_df = locked_state.rename(columns={"Truck Size (T)": "Truck Size"})[PLAN_COLS].copy()
+        locked_display_df["Load (Ton)"] = pd.to_numeric(locked_display_df["Load (Ton)"], errors="coerce")
+    else:
+        locked_display_df = pd.DataFrame(columns=PLAN_COLS)
+    locked_keys = set(locked_display_df["ShipmentKey"])
+    locked_vehicle_numbers = set(
+        locked_display_df.loc[locked_display_df["Source"].isin(["Own", "Fixed"]), "Vehicle Number"]
+    )
 
-    if not alloc_results_df.empty:
-        alloc_results_df = alloc_results_df.rename(columns={"Load": "Load (Ton)"})
-        alloc_results_df["Gate Out Date"] = np.where(
-            alloc_results_df["Source"].isin(["Own", "Fixed"]), as_of_date, ""
+    # --- Still-Pending shipments: suggest a vehicle now, one shipment at a time, pulling
+    # any vehicle already locked to an Allotted/Dispatched shipment (above) OR to an
+    # earlier shipment in this same pass out of the pool first — so the same real vehicle
+    # is never suggested to two different shipments.
+    pending_rows_df = shipments_to_plan_df[~shipments_to_plan_df["ShipmentKey"].isin(locked_keys)].copy()
+    current_fleet_pool = fleet_status_df.copy()
+    if locked_vehicle_numbers:
+        _lock_mask = current_fleet_pool["Vehicle Number"].astype(str).str.strip().str.upper().isin(
+            {str(v).strip().upper() for v in locked_vehicle_numbers}
         )
-        alloc_results_df = alloc_results_df[
-            ["Vehicle Number", "Truck Size", "Load (Ton)", "Source", "Distributor",
-             "Gate Out Date"]
-        ]
+        current_fleet_pool.loc[_lock_mask, "Status"] = "Locked"
 
-    trucks_needed_today = len(alloc_results)
-    own_used_today = int((alloc_results_df["Source"] == "Own").sum()) if not alloc_results_df.empty else 0
-    fixed_used_today = int((alloc_results_df["Source"] == "Fixed").sum()) if not alloc_results_df.empty else 0
-    spot_needed_today = int((alloc_results_df["Source"] == "Spot Hire").sum()) if not alloc_results_df.empty else 0
+    suggested_rows = []
+    for _, srow in pending_rows_df.iterrows():
+        single_cap = _dist_cap_lookup.get(str(srow["Route / Distributor"]).strip().casefold())
+        result = allocate_shipments_to_fleet(
+            [srow["Load (Ton)"]], current_fleet_pool, veh_block_tons,
+            buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
+            distributors=[srow["Route / Distributor"]], max_tonnages=[single_cap]
+        )
+        for r in result:
+            r["ShipmentKey"] = srow["ShipmentKey"]
+            r["Status"] = "Pending"
+            suggested_rows.append(r)
+            if r["Source"] in ("Own", "Fixed"):
+                vn = str(r["Vehicle Number"]).strip().upper()
+                _mask = current_fleet_pool["Vehicle Number"].astype(str).str.strip().str.upper() == vn
+                current_fleet_pool = current_fleet_pool.copy()
+                current_fleet_pool.loc[_mask, "Status"] = "Locked"
 
-    st.caption(f"Load source: **{load_source_note}** · {len(shipment_loads)} shipments totaling "
+    suggested_df = pd.DataFrame(suggested_rows)
+    if not suggested_df.empty:
+        suggested_df = suggested_df.rename(columns={"Load": "Load (Ton)"})[PLAN_COLS]
+    else:
+        suggested_df = pd.DataFrame(columns=PLAN_COLS)
+
+    plan_df = pd.concat([locked_display_df, suggested_df], ignore_index=True)
+
+    trucks_needed_today = len(plan_df)
+    own_used_today = int((plan_df["Source"] == "Own").sum()) if not plan_df.empty else 0
+    fixed_used_today = int((plan_df["Source"] == "Fixed").sum()) if not plan_df.empty else 0
+    spot_needed_today = int((plan_df["Source"] == "Spot Hire").sum()) if not plan_df.empty else 0
+    dispatched_today = int((plan_df["Status"] == "Dispatched").sum()) if not plan_df.empty else 0
+
+    st.caption(f"Load source: **{load_source_note}** · {len(shipments_to_plan_df)} shipments totaling "
                f"{total_load_today:,} tons (with a {buffer_tons_live}-ton/truck buffer) → "
                f"**{trucks_needed_today:,} trucks needed today**, matched against your real available fleet.")
 
-    d1, d2, d3, d4 = st.columns(4)
+    d1, d2, d3, d4, d5 = st.columns(5)
     d1.metric("Trucks Needed", f"{trucks_needed_today:,}")
     d2.metric("🟦 Own Used", f"{own_used_today:,}")
     d3.metric("🟧 Fixed Used", f"{fixed_used_today:,}")
     d4.metric("🟥 Spot Hire Needed NOW", f"{spot_needed_today:,}")
+    d5.metric("✅ Dispatched", f"{dispatched_today:,}")
 
     if trucks_needed_today > 0:
-        st.dataframe(alloc_results_df, use_container_width=True, hide_index=True)
+        st.caption("Change **Status** below: **Allotted** fixes that suggested vehicle to this shipment "
+                   "(no more re-suggesting it elsewhere); **Dispatched** logs it into the Vehicle Out log "
+                   "above right away. Includes Spot Hire (shown as **market** in Vehicle Number).")
+        edited_plan_df = st.data_editor(
+            plan_df, use_container_width=True, hide_index=True, key="dispatch_status_editor",
+            column_order=["Distributor", "Load (Ton)", "Truck Size", "Vehicle Number", "Source", "Status"],
+            disabled=["Distributor", "Load (Ton)", "Truck Size", "Vehicle Number", "Source"],
+            column_config={"Status": st.column_config.SelectboxColumn(options=ALLOCATION_STATUS_OPTIONS)}
+        )
         if spot_needed_today > 0:
             st.warning(f"⚠️ Arrange **{spot_needed_today} spot hire vehicles** today — your Own/Fixed fleet "
                        f"doesn't have enough AVAILABLE vehicles of the right size for {spot_needed_today} "
@@ -657,26 +708,97 @@ with st.container(border=True):
             st.success("✅ Own + Fixed availability — with the right tonnage on hand — covers today's need. "
                        "No spot hire required.")
 
+        if st.button("✅ Apply Status Changes", use_container_width=True, key="apply_status_btn"):
+            new_state_rows = []
+            gate_out_new_entries = []
+            revert_keys = []
+            blocked_any = False
+            for _, row in edited_plan_df.iterrows():
+                key = row["ShipmentKey"]
+                _prev = alloc_state_today.loc[alloc_state_today["ShipmentKey"] == key, "Status"] if len(alloc_state_today) else pd.Series(dtype=str)
+                prev_status = _prev.iloc[0] if len(_prev) else "Pending"
+                new_status = row["Status"]
+                if new_status == prev_status:
+                    continue
+                if prev_status == "Dispatched":
+                    blocked_any = True
+                    continue
+                if new_status == "Pending":
+                    revert_keys.append(key)
+                    continue
+                new_state_rows.append({
+                    "ShipmentKey": key, "Date": today_str, "Distributor": row["Distributor"],
+                    "Load (Ton)": row["Load (Ton)"], "Vehicle Number": row["Vehicle Number"],
+                    "Truck Size (T)": row["Truck Size"], "Source": row["Source"], "Status": new_status,
+                })
+                if new_status == "Dispatched":
+                    gate_out_new_entries.append({
+                        "Vehicle Number": row["Vehicle Number"], "Ownership": row["Source"],
+                        "Truck Size (T)": row["Truck Size"], "Gate Out Date": today_str,
+                        "Actual Return Date": "", "Route / Distributor": row["Distributor"],
+                    })
+
+            if revert_keys:
+                save_allocation_state(alloc_state_all[~alloc_state_all["ShipmentKey"].isin(revert_keys)])
+            if new_state_rows:
+                upsert_allocation_state(pd.DataFrame(new_state_rows))
+            if gate_out_new_entries:
+                # dedupe=False: Spot Hire rows can legitimately repeat the same "(market)"
+                # vehicle number + size + distributor for genuinely separate trucks, which
+                # a blanket duplicate-row check would wrongly collapse.
+                append_gate_out_entries(pd.DataFrame(gate_out_new_entries), dedupe=False)
+
+            if blocked_any:
+                st.warning("Some rows were already Dispatched and can't be changed here — edit the "
+                           "Vehicle Out log above directly if you need to correct one.")
+            if new_state_rows or gate_out_new_entries or revert_keys:
+                st.success("Updated.")
+                st.rerun()
+            else:
+                st.info("No changes to apply.")
+
 st.write("---")
 
 # ---------------- VEHICLE-LEVEL DETAIL ----------------
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("✅ Available Vehicles (ready to dispatch)")
+    st.caption("Change **Remarks** right here — no need to edit the source Excel. Only vehicles "
+               "marked **Operational** count as available for planning above.")
     avail_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "CapacityTonnage", "Remarks"]
                   if c in fleet_status_df.columns]
     avail_show = fleet_status_df[fleet_status_df["Status"] == "Available"][avail_cols].copy()
+    if "CapacityTonnage" in avail_show.columns:
+        avail_show["Truck Size"] = avail_show["CapacityTonnage"].apply(format_truck_size)
+        avail_show = avail_show.drop(columns=["CapacityTonnage"])
+        avail_cols = [c for c in avail_cols if c != "CapacityTonnage"] + ["Truck Size"]
     if "Remarks" in avail_show.columns:
-        avail_show["Remarks"] = avail_show["Remarks"].replace("", "—")
-    st.dataframe(avail_show, use_container_width=True, height=320, hide_index=True)
-    st.download_button("⬇️ Download available vehicles (CSV)", avail_show.to_csv(index=False).encode("utf-8"),
+        avail_show.loc[~avail_show["Remarks"].isin(REMARKS_OPTIONS), "Remarks"] = "Operational"
+        edited_avail = st.data_editor(
+            avail_show, use_container_width=True, height=320, hide_index=True, key="avail_vehicles_editor",
+            disabled=[c for c in avail_cols if c != "Remarks"],
+            column_config={"Remarks": st.column_config.SelectboxColumn(options=REMARKS_OPTIONS)}
+        )
+        if st.button("💾 Save status changes", key="save_vehicle_status_btn"):
+            changed = edited_avail[["Vehicle Number", "Remarks"]].copy()
+            merged_overrides = pd.concat([status_overrides_df, changed], ignore_index=True)
+            save_vehicle_status_overrides(merged_overrides)
+            st.success("Saved — statuses updated.")
+            st.rerun()
+    else:
+        edited_avail = avail_show
+        st.dataframe(avail_show, use_container_width=True, height=320, hide_index=True)
+    st.download_button("⬇️ Download available vehicles (CSV)", edited_avail.to_csv(index=False).encode("utf-8"),
                         file_name=f"available_vehicles_{as_of_date}.csv", mime="text/csv")
 
 with c2:
     st.subheader("🚫 Vehicles Currently Out")
-    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "Distributor", "Days Out", "Remarks"]
+    out_cols = [c for c in ["Vehicle Number", "OwnershipType", "Location", "Transporter Name", "CapacityTonnage", "Distributor", "Days Out", "Remarks"]
                 if c in fleet_status_df.columns]
     out_show = fleet_status_df[fleet_status_df["Status"] == "Out"][out_cols].copy()
+    if "CapacityTonnage" in out_show.columns:
+        out_show["Truck Size"] = out_show["CapacityTonnage"].apply(format_truck_size)
+        out_show = out_show.drop(columns=["CapacityTonnage"])
     if "Distributor" in out_show.columns:
         out_show["Distributor"] = out_show["Distributor"].fillna("—")
     if "Remarks" in out_show.columns:
@@ -687,20 +809,33 @@ with c2:
 
 with st.expander("ℹ️ How this works"):
     st.markdown("""
-    1. Your transport office logs every gate-out in a shared Google Sheet (Vehicle Number, Ownership,
-       Gate Out Date), filling in **Actual Return Date** once a truck is back.
-    2. This page cross-references those Vehicle Numbers against your **actual Vehicle Database**, so
-       every truck is tracked individually — not just as an aggregate count. Unrecognized vehicle
-       numbers (typos, unregistered trucks) are flagged separately.
-    3. **Available = registered fleet − currently out**, giving real intraday status.
-    4. For **Today's Load**, enter each shipment separately (route/distributor + tons) rather than one
-       lump total — real dispatch is many different-sized loads, not one uniform number. Each shipment
-       is matched to the closest AVAILABLE real vehicle tonnage that still covers it (+ your overload
-       buffer) — Own first (including any size only Own has), then Fixed, then Spot Hire — checked
-       **vehicle by vehicle against actual tonnage on hand**, not just a headcount. Fixed and Spot Hire
-       are capped at whatever the largest real Fixed vehicle in your fleet actually is, so neither is
-       ever offered a size they don't physically have.
+    1. For **Today's Load**, enter each shipment separately (route/distributor + tons) rather than one
+       lump total — real dispatch is many different-sized loads, not one uniform number. Each Pending
+       shipment is matched to the closest AVAILABLE real vehicle tonnage that still covers it (+ your
+       overload buffer) — Own first (including any size only Own has), then Fixed, then Spot Hire —
+       checked **vehicle by vehicle against actual tonnage on hand**, not just a headcount. Fixed and
+       Spot Hire are capped at whatever the largest real Fixed vehicle in your fleet actually is, so
+       neither is ever offered a size they don't physically have.
+    2. Each shipment has its own **Status**: **Pending → Allotted → Dispatched**.
+       - Set it to **Allotted** to fix that suggested vehicle to this shipment — it's locked and won't
+         be re-suggested to a different shipment on the next refresh.
+       - Set it to **Dispatched** once the truck actually leaves — this logs it into the **Vehicle Out**
+         log above automatically (Vehicle Number, Ownership, Truck Size, Gate Out Date, Distributor),
+         including Spot Hire (shown as **market** in Vehicle Number). No manual copy-paste needed.
+       - Click **✅ Apply Status Changes** to save whichever rows you've updated. A Dispatched row can't
+         be changed back here — edit the Vehicle Out log directly if you need to correct one.
+    3. This page cross-references every real Vehicle Number in the Vehicle Out log (Own/Fixed) against
+       your **actual Vehicle Database**, so each truck is tracked individually — not just as an aggregate
+       count. Unrecognized vehicle numbers (typos, unregistered trucks) are flagged separately. Spot Hire
+       rows stay visible in the log for the record but aren't checked against the Vehicle Database, since
+       they're not your registered vehicles.
+    4. **Available = registered fleet − currently out − marked non-operational.** Use the dropdown in the
+       **✅ Available Vehicles** table to flip a vehicle's status (Operational / Non-Operational /
+       Maintenance / Driver Not Available) any time — no need to touch the source Excel; only
+       **Operational** vehicles are offered for planning above.
+    5. The Vehicle Out log is a single, local table — no Google Sheet dependency. If you're moving off an
+       old gate-out sheet, use the **📤 One-time import** expander above the log to upload it as CSV once.
 
-    **Publishing a Google Sheet as CSV:** open the sheet → File → Share → Publish to web → choose the
+    **Publishing the Load Log Sheet as CSV:** open the sheet → File → Share → Publish to web → choose the
     correct tab → format **Comma-separated values (.csv)** → Publish → copy the link into the sidebar.
     """)
