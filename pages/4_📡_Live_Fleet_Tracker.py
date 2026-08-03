@@ -14,10 +14,10 @@ from utils.data_loader import (
     allocate_trucks_by_tonnage, allocate_shipments_to_fleet, already_dispatched_routes,
     load_db_capacity, load_gate_out_log_local, save_gate_out_log_local,
     append_gate_out_entries, load_vehicle_status_overrides, save_vehicle_status_overrides,
-    apply_vehicle_status_overrides, REMARKS_OPTIONS, GATE_OUT_LOG_COLUMNS,
+    apply_vehicle_status_overrides, REMARKS_OPTIONS,
     get_distributor_list, unmatched_distributor_names, format_truck_size,
     load_allocation_state, save_allocation_state, upsert_allocation_state,
-    ALLOCATION_STATUS_OPTIONS
+    ALLOCATION_STATUS_OPTIONS, github_persistence_enabled
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -739,29 +739,15 @@ with c2:
         "above. Edit **Return Date** (calendar) once a truck is back, or fix **Ownership** — this "
         "is the one and only Vehicle Out table."
     )
-
-    with st.expander("📤 One-time: bring in old gate-out data from your previous Google Sheet"):
-        st.caption(
-            "Download your old gate-out sheet as CSV (File → Download → Comma Separated Values) and "
-            "upload it here once — it'll be copied permanently into this table below, matched by "
-            "column name. After this you can delete the old sheet; the app no longer reads from it."
+    if github_persistence_enabled():
+        st.caption("✅ Auto-saved to your GitHub repo on every change — survives app reboots/redeploys.")
+    else:
+        st.warning(
+            "⚠️ **Not reboot-safe yet.** This data currently lives only on the app's local disk, which "
+            "resets on every redeploy/restart. Add `github_token`, `github_repo` (and optionally "
+            "`github_branch`) in Settings → Secrets to make every save/dispatch here permanent — see "
+            "the *How this works* section below for the exact steps."
         )
-        migrate_file = st.file_uploader("Old gate-out sheet (CSV)", type=["csv"], key="migrate_gate_out_upload")
-        if migrate_file is not None:
-            try:
-                migrate_df = pd.read_csv(migrate_file)
-                migrate_df.columns = [str(c).strip() for c in migrate_df.columns]
-                migrate_df = migrate_df.replace(r'^\s*$', pd.NA, regex=True).dropna(how="all")
-                for c in GATE_OUT_LOG_COLUMNS:
-                    if c not in migrate_df.columns:
-                        migrate_df[c] = ""
-                st.dataframe(migrate_df[GATE_OUT_LOG_COLUMNS].head(10), use_container_width=True, hide_index=True)
-                if st.button(f"📥 Import these {len(migrate_df)} row(s) into the Vehicle Out log", key="migrate_import_btn"):
-                    append_gate_out_entries(migrate_df[GATE_OUT_LOG_COLUMNS])
-                    st.success("Imported — see them in the table below.")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"⚠️ Couldn't read that file ({e}).")
 
     log_distributor_options = sorted(set(distributor_list) | {""} | set(
         str(v).strip() for v in base_log_df["Route / Distributor"].dropna() if str(v).strip()
@@ -773,15 +759,29 @@ with c2:
     display_log_df["Actual Return Date"] = pd.to_datetime(display_log_df["Actual Return Date"], errors="coerce")
     display_log_df["Load (Ton)"] = pd.to_numeric(display_log_df["Load (Ton)"], errors="coerce")
 
+    # Days Out is computed fresh every render, never stored — still out → days since Gate
+    # Out up to today; already back → the completed duration up to its Return Date.
+    _as_of_ts = pd.Timestamp(as_of_date)
+    def _days_out(r):
+        god = r["Gate Out Date"]
+        if pd.isna(god):
+            return pd.NA
+        ard = r["Actual Return Date"]
+        end = ard if pd.notna(ard) else _as_of_ts
+        return max((end - god).days, 0)
+    display_log_df["Days Out"] = display_log_df.apply(_days_out, axis=1).astype("Int64")
+
     edited_log_df = st.data_editor(
         display_log_df, num_rows="dynamic", use_container_width=True, height=320, key="gate_out_log_editor",
         column_order=["Vehicle Number", "Ownership", "Truck Size (T)", "Gate Out Date",
-                      "Actual Return Date", "Route / Distributor", "Load (Ton)"],
+                      "Actual Return Date", "Days Out", "Route / Distributor", "Load (Ton)"],
+        disabled=["Days Out"],
         column_config={
             "Ownership": st.column_config.SelectboxColumn(options=["Own", "Fixed", "Spot Hire"]),
             "Truck Size (T)": st.column_config.TextColumn(label="Truck Size"),
             "Gate Out Date": st.column_config.DateColumn(label="Gate Out", format="DD-MM-YYYY"),
             "Actual Return Date": st.column_config.DateColumn(label="Return Date", format="DD-MM-YYYY"),
+            "Days Out": st.column_config.NumberColumn(label="Days Out", help="Since Gate Out — up to today if still out, or up to Return Date once back"),
             "Route / Distributor": st.column_config.SelectboxColumn(label="Distributor", options=log_distributor_options),
             "Load (Ton)": st.column_config.NumberColumn(label="Load (Ton)", format="%.1f"),
         }
@@ -826,8 +826,21 @@ with st.expander("ℹ️ How this works"):
        **✅ Available Vehicles** table to flip a vehicle's status (Operational / Non-Operational /
        Maintenance / Driver Not Available) any time — no need to touch the source Excel; only
        **Operational** vehicles are offered for planning above.
-    5. The Vehicle Out log is a single, local table — no Google Sheet dependency. If you're moving off an
-       old gate-out sheet, use the **📤 One-time import** expander above the log to upload it as CSV once.
+    5. The Vehicle Out log, vehicle status overrides, and dispatch status are all single local tables —
+       no Google Sheet dependency. **To make them survive an app reboot/redeploy** (Streamlit resets local
+       disk on every restart otherwise), connect the app to your GitHub repo:
+       - Create a **fine-grained personal access token** at github.com → Settings → Developer settings →
+         Personal access tokens, scoped to just this repo, with **Contents: Read and write** permission.
+       - In your Streamlit app's **Settings → Secrets**, add:
+         ```
+         github_token = "your-token-here"
+         github_repo = "your-username/your-repo-name"
+         github_branch = "main"
+         ```
+       - Save — no redeploy needed, it takes effect on the next run. You'll see a green "Auto-saved to
+         your GitHub repo" note above the Vehicle Out table once it's working instead of the yellow warning.
+       - From then on, every save/dispatch here also commits straight into `local_data/` in your repo, so
+         a fresh boot reads back exactly what was last saved.
 
     **Publishing the Load Log Sheet as CSV:** open the sheet → File → Share → Publish to web → choose the
     correct tab → format **Comma-separated values (.csv)** → Publish → copy the link into the sidebar.
