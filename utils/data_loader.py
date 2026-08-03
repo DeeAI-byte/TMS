@@ -9,9 +9,11 @@ here, so numbers stay consistent across pages.
 import os
 import re
 import math
+import base64
 import itertools
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -35,6 +37,77 @@ ALLOCATION_STATE_COLUMNS = [
     "Vehicle Number", "Truck Size (T)", "Source", "Status"
 ]
 ALLOCATION_STATUS_OPTIONS = ["Pending", "Allotted", "Dispatched"]
+
+
+# --------------------------------------------------------------------------------------
+# PERSISTENCE ACROSS REBOOTS — local_data/*.csv lives on the app container's own disk,
+# which Streamlit Community Cloud wipes on every redeploy/restart. To survive that, every
+# save here also commits the file straight into your GitHub repo via the GitHub API (the
+# same repo the app deploys from) — so the very next boot reads back exactly what was
+# last saved, not an empty file. This only activates once you add repo credentials in
+# Settings → Secrets (github_token, github_repo, optionally github_branch); until then,
+# everything still works, it just stays local-only (and a warning shows in the app).
+# --------------------------------------------------------------------------------------
+def _get_secret(name, default=None):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+GITHUB_TOKEN = _get_secret("github_token")
+GITHUB_REPO = _get_secret("github_repo")          # "your-username/your-repo-name"
+GITHUB_BRANCH = _get_secret("github_branch", "main")
+GITHUB_DATA_PREFIX = _get_secret("github_data_path", "local_data")
+
+
+def github_persistence_enabled():
+    return bool(GITHUB_TOKEN and GITHUB_REPO)
+
+
+def _github_headers():
+    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+
+def _github_api_url(filename):
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_DATA_PREFIX}/{filename}"
+
+
+def github_pull_file(filename):
+    """Fetches a file's raw text content from the repo. Returns None if not configured,
+    not found, or the request fails for any reason (never raises — best-effort)."""
+    if not github_persistence_enabled():
+        return None
+    try:
+        resp = requests.get(_github_api_url(filename), headers=_github_headers(),
+                             params={"ref": GITHUB_BRANCH}, timeout=10)
+        if resp.status_code != 200:
+            return None
+        return base64.b64decode(resp.json()["content"]).decode("utf-8")
+    except Exception:
+        return None
+
+
+def github_push_file(filename, content_str, message):
+    """Commits a file's new content to the repo (creating or updating it). Best-effort —
+    failures are swallowed so the app keeps working off local disk even if the commit
+    fails (e.g. bad token, offline, rate limit)."""
+    if not github_persistence_enabled():
+        return False
+    try:
+        url = _github_api_url(filename)
+        get_resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
+        sha = get_resp.json().get("sha") if get_resp.status_code == 200 else None
+        payload = {
+            "message": message,
+            "content": base64.b64encode(content_str.encode("utf-8")).decode("utf-8"),
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            payload["sha"] = sha
+        put_resp = requests.put(url, headers=_github_headers(), json=payload, timeout=10)
+        return put_resp.status_code in (200, 201)
+    except Exception:
+        return False
 
 
 def format_truck_size(value):
@@ -523,8 +596,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
 # table, just seeded automatically instead of starting blank every day.
 # --------------------------------------------------------------------------------------
 def load_gate_out_log_local():
-    """Loads the persisted Vehicle Out log from local storage, creating an empty one
-    (with the right columns) if it doesn't exist yet."""
+    """Loads the persisted Vehicle Out log — from local disk if present, else restored
+    from GitHub (survives a redeploy that wiped local disk), else empty."""
     os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
     if os.path.exists(GATE_OUT_LOG_PATH):
         try:
@@ -535,17 +608,33 @@ def load_gate_out_log_local():
             return df[GATE_OUT_LOG_COLUMNS].reset_index(drop=True)
         except Exception:
             pass
+    remote = github_pull_file("gate_out_log.csv")
+    if remote:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
+            for c in GATE_OUT_LOG_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[GATE_OUT_LOG_COLUMNS].reset_index(drop=True)
+            df.to_csv(GATE_OUT_LOG_PATH, index=False)
+            return df
+        except Exception:
+            pass
     return pd.DataFrame(columns=GATE_OUT_LOG_COLUMNS)
 
 
 def save_gate_out_log_local(df):
-    """Overwrites the local Vehicle Out log with the given (already-edited) dataframe."""
+    """Overwrites the local Vehicle Out log with the given (already-edited) dataframe,
+    and pushes it to GitHub too (if configured) so it survives the next reboot."""
     os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
     df = df.copy()
     for c in GATE_OUT_LOG_COLUMNS:
         if c not in df.columns:
             df[c] = ""
-    df[GATE_OUT_LOG_COLUMNS].to_csv(GATE_OUT_LOG_PATH, index=False)
+    df = df[GATE_OUT_LOG_COLUMNS]
+    df.to_csv(GATE_OUT_LOG_PATH, index=False)
+    github_push_file("gate_out_log.csv", df.to_csv(index=False), "Update Vehicle Out log")
 
 
 def append_gate_out_entries(new_rows_df, dedupe=True):
@@ -599,6 +688,19 @@ def load_vehicle_status_overrides():
             return df[VEHICLE_STATUS_COLUMNS].reset_index(drop=True)
         except Exception:
             pass
+    remote = github_pull_file("vehicle_status_overrides.csv")
+    if remote:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
+            for c in VEHICLE_STATUS_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[VEHICLE_STATUS_COLUMNS].reset_index(drop=True)
+            df.to_csv(VEHICLE_STATUS_OVERRIDES_PATH, index=False)
+            return df
+        except Exception:
+            pass
     return pd.DataFrame(columns=VEHICLE_STATUS_COLUMNS)
 
 
@@ -607,7 +709,9 @@ def save_vehicle_status_overrides(df):
     df = df.copy()
     df["Vehicle Number"] = df["Vehicle Number"].astype(str).str.strip().str.upper()
     df = df.drop_duplicates(subset=["Vehicle Number"], keep="last")
-    df[VEHICLE_STATUS_COLUMNS].to_csv(VEHICLE_STATUS_OVERRIDES_PATH, index=False)
+    df = df[VEHICLE_STATUS_COLUMNS]
+    df.to_csv(VEHICLE_STATUS_OVERRIDES_PATH, index=False)
+    github_push_file("vehicle_status_overrides.csv", df.to_csv(index=False), "Update vehicle status overrides")
 
 
 def apply_vehicle_status_overrides(veh_db, overrides_df):
@@ -645,6 +749,19 @@ def load_allocation_state():
             return df[ALLOCATION_STATE_COLUMNS].reset_index(drop=True)
         except Exception:
             pass
+    remote = github_pull_file("allocation_state.csv")
+    if remote:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
+            for c in ALLOCATION_STATE_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[ALLOCATION_STATE_COLUMNS].reset_index(drop=True)
+            df.to_csv(ALLOCATION_STATE_PATH, index=False)
+            return df
+        except Exception:
+            pass
     return pd.DataFrame(columns=ALLOCATION_STATE_COLUMNS)
 
 
@@ -655,7 +772,9 @@ def save_allocation_state(df):
         if c not in df.columns:
             df[c] = ""
     df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
-    df[ALLOCATION_STATE_COLUMNS].to_csv(ALLOCATION_STATE_PATH, index=False)
+    df = df[ALLOCATION_STATE_COLUMNS]
+    df.to_csv(ALLOCATION_STATE_PATH, index=False)
+    github_push_file("allocation_state.csv", df.to_csv(index=False), "Update dispatch allocation state")
 
 
 def upsert_allocation_state(rows_df):
