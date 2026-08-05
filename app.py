@@ -7,10 +7,11 @@ import os
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.data_loader import (
     load_locations, load_db_capacity, load_vehicle_database,
-    load_db_target, build_master_table, get_month_options
+    load_db_target, build_master_table, get_month_options, require_dashboard_password
 )
 
 st.set_page_config(page_title="Logistics TMS | Overview", page_icon="🚛", layout="wide")
+require_dashboard_password()
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
 st.title("🚛 Transport Management System — Overview")
