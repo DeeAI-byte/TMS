@@ -17,7 +17,8 @@ from utils.data_loader import (
     apply_vehicle_status_overrides, REMARKS_OPTIONS,
     get_distributor_list, unmatched_distributor_names, format_truck_size,
     load_allocation_state, save_allocation_state, upsert_allocation_state,
-    ALLOCATION_STATUS_OPTIONS, github_persistence_enabled
+    ALLOCATION_STATUS_OPTIONS, github_persistence_enabled,
+    load_manual_shipments, save_manual_shipments, MANUAL_SHIPMENT_STATUS_OPTIONS
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -389,21 +390,20 @@ with st.container(border=True):
                "different-sized shipments, not one lump total, and each is matched to the closest "
                "available vehicle tonnage (not just a total capacity assumption).")
 
-    shipments_df = None
+    sheet_shipments_df = None
     load_source_note = ""
 
     if load_sheet_url:
         if _summary_fetch_error:
             st.error(f"⚠️ Couldn't read Load Log sheet ({_summary_fetch_error}).")
         else:
-            shipments_df = _summary_shipments_df
-            load_source_note = f"Google Sheet ({as_of_date.strftime('%d %b %Y')})"
-            if shipments_df is not None and not shipments_df.empty:
-                st.dataframe(shipments_df, use_container_width=True, hide_index=True)
+            sheet_shipments_df = _summary_shipments_df
+            if sheet_shipments_df is not None and not sheet_shipments_df.empty:
+                st.dataframe(sheet_shipments_df, use_container_width=True, hide_index=True)
             else:
                 st.warning(
                     f"⚠️ No shipments found for {as_of_date.strftime('%d %b %Y')} in the Load Log sheet — "
-                    "enter today's rows in the sheet or use the manual fallback below."
+                    "enter today's rows in the sheet, or add them manually below."
                 )
                 with st.expander("🔍 Why is this empty? (diagnostic)"):
                     if _summary_raw_df is not None:
@@ -449,26 +449,50 @@ with st.container(border=True):
                             "Google is serving right now."
                         )
     else:
-        st.info("Add a Load Log Sheet link in the sidebar.")
+        st.info("Add a Load Log Sheet link in the sidebar, or add shipments manually below.")
 
-    if shipments_df is None:
-        if "fallback_shipments_df" not in st.session_state:
-            st.session_state.fallback_shipments_df = pd.DataFrame({
-                "Route / Distributor": [""], "Load (Ton)": [0.0]
-            })
-        fallback_options = sorted(set(distributor_list) | {""} | set(
-            str(v).strip() for v in st.session_state.fallback_shipments_df["Route / Distributor"].dropna()
-            if str(v).strip()
-        ))
-        shipments_df = st.data_editor(
-            st.session_state.fallback_shipments_df, num_rows="dynamic", use_container_width=True,
-            key="fallback_shipments_editor",
-            column_config={
-                "Load (Ton)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
-                "Route / Distributor": st.column_config.SelectboxColumn(options=fallback_options),
-            }
-        )
-        load_source_note = "manual fallback"
+    # ---- Manual shipment entry — always available, merges with the sheet above (not a
+    # fallback that only appears when the sheet is missing). Persisted (incl. GitHub), and
+    # every field is a dropdown/number field pulling from the same real master data the
+    # rest of the app uses, so there's nothing to mistype.
+    st.markdown("**➕ Add shipments manually**")
+    manual_shipments_df = load_manual_shipments()
+    manual_dist_options = sorted(set(distributor_list) | {""} | set(
+        str(v).strip() for v in manual_shipments_df["Route / Distributor"].dropna() if str(v).strip()
+    ))
+    manual_shipments_display = manual_shipments_df.copy()
+    manual_shipments_display["Load (Ton)"] = pd.to_numeric(manual_shipments_display["Load (Ton)"], errors="coerce")
+    manual_shipments_display.loc[
+        ~manual_shipments_display["Status"].isin(MANUAL_SHIPMENT_STATUS_OPTIONS), "Status"
+    ] = "Pending"
+    edited_manual_shipments_df = st.data_editor(
+        manual_shipments_display, num_rows="dynamic", use_container_width=True, key="manual_shipments_editor",
+        column_config={
+            "Route / Distributor": st.column_config.SelectboxColumn(options=manual_dist_options),
+            "Load (Ton)": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="%.1f"),
+            "Status": st.column_config.SelectboxColumn(options=MANUAL_SHIPMENT_STATUS_OPTIONS),
+        }
+    )
+    if st.button("💾 Save manual shipments", key="save_manual_shipments_btn"):
+        save_manual_shipments(edited_manual_shipments_df)
+        st.success("Saved.")
+        st.rerun()
+
+    manual_valid_df = edited_manual_shipments_df[
+        edited_manual_shipments_df["Route / Distributor"].astype(str).str.strip().ne("") &
+        (pd.to_numeric(edited_manual_shipments_df["Load (Ton)"], errors="coerce").fillna(0) > 0)
+    ].copy()
+
+    parts = [d for d in (sheet_shipments_df, manual_valid_df) if d is not None and not d.empty]
+    shipments_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(
+        columns=["Route / Distributor", "Load (Ton)", "Status"]
+    )
+    source_bits = []
+    if sheet_shipments_df is not None and not sheet_shipments_df.empty:
+        source_bits.append("Google Sheet")
+    if not manual_valid_df.empty:
+        source_bits.append("manual entries")
+    load_source_note = " + ".join(source_bits) if source_bits else "none yet"
 
     # The table above shows every shipment for today, any status — but only Pending
     # shipments should ever be planned/allocated a vehicle. Dispatched ones stay visible
