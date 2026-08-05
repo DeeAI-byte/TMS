@@ -31,6 +31,10 @@ GATE_OUT_LOG_COLUMNS = [
 VEHICLE_STATUS_COLUMNS = ["Vehicle Number", "Remarks"]
 REMARKS_OPTIONS = ["Operational", "Non-Operational", "Maintenance", "Driver Not Available"]
 
+MANUAL_SHIPMENTS_PATH = os.path.join(LOCAL_DATA_DIR, "manual_shipments.csv")
+MANUAL_SHIPMENTS_COLUMNS = ["Route / Distributor", "Load (Ton)", "Status"]
+MANUAL_SHIPMENT_STATUS_OPTIONS = ["Pending", "Dispatched"]
+
 ALLOCATION_STATE_PATH = os.path.join(LOCAL_DATA_DIR, "allocation_state.csv")
 ALLOCATION_STATE_COLUMNS = [
     "ShipmentKey", "Date", "Distributor", "Load (Ton)",
@@ -730,6 +734,50 @@ def apply_vehicle_status_overrides(veh_db, overrides_df):
             lambda r: ov_map.get(r["Vehicle Number"], r["Remarks"]), axis=1
         )
     return veh
+
+
+# --------------------------------------------------------------------------------------
+# MANUAL SHIPMENT ENTRY — lets the office add today's shipments straight from the app
+# (Distributor dropdown, Load in tons, Status), instead of only via the Load Log Google
+# Sheet. Both sources merge in Today's Load; this one persists (incl. GitHub) so entries
+# aren't lost between visits.
+# --------------------------------------------------------------------------------------
+def load_manual_shipments():
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    if os.path.exists(MANUAL_SHIPMENTS_PATH):
+        try:
+            df = pd.read_csv(MANUAL_SHIPMENTS_PATH, dtype=str).fillna("")
+            for c in MANUAL_SHIPMENTS_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[MANUAL_SHIPMENTS_COLUMNS].reset_index(drop=True)
+        except Exception:
+            pass
+    remote = github_pull_file("manual_shipments.csv")
+    if remote:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
+            for c in MANUAL_SHIPMENTS_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[MANUAL_SHIPMENTS_COLUMNS].reset_index(drop=True)
+            df.to_csv(MANUAL_SHIPMENTS_PATH, index=False)
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=MANUAL_SHIPMENTS_COLUMNS)
+
+
+def save_manual_shipments(df):
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    df = df.copy()
+    for c in MANUAL_SHIPMENTS_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[MANUAL_SHIPMENTS_COLUMNS]
+    df.to_csv(MANUAL_SHIPMENTS_PATH, index=False)
+    github_push_file("manual_shipments.csv", df.to_csv(index=False), "Update manually-entered shipments")
 
 
 # --------------------------------------------------------------------------------------
