@@ -68,6 +68,34 @@ def github_persistence_enabled():
     return bool(GITHUB_TOKEN and GITHUB_REPO)
 
 
+# --------------------------------------------------------------------------------------
+# DASHBOARD ACCESS GATE — a simple shared password for pages you don't want the transport
+# team seeing (Overview, Route Creation, the two Fleet Calculators). Live Fleet Tracker is
+# left ungated on purpose. Set `dashboard_password` in Settings → Secrets to turn this on;
+# until then, require_dashboard_password() does nothing (pages stay open) so nothing
+# breaks for you before you've configured it.
+# --------------------------------------------------------------------------------------
+def require_dashboard_password():
+    """Call at the very top of a page (after st.set_page_config). Blocks the rest of the
+    page behind a password prompt until the correct `dashboard_password` secret is
+    entered. Once entered correctly, stays unlocked for the rest of this browser session
+    (across all gated pages) — no need to re-enter it per page."""
+    correct = _get_secret("dashboard_password")
+    if not correct:
+        return  # not configured — page stays open, same as today
+    if st.session_state.get("dashboard_unlocked"):
+        return
+    st.title("🔒 Restricted")
+    entered = st.text_input("Password", type="password", key="dashboard_password_input")
+    if st.button("Unlock"):
+        if entered == correct:
+            st.session_state["dashboard_unlocked"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    st.stop()
+
+
 def _github_headers():
     return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 
