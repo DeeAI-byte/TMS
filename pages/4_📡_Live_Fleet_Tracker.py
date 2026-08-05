@@ -810,6 +810,9 @@ with c2:
             "Load (Ton)": st.column_config.NumberColumn(label="Load (Ton)", format="%.1f"),
         }
     )
+    st.caption("💡 Paste bulk data straight in: click the top-left cell and paste from Excel/Sheets — "
+               "add blank rows first with the **+** at the bottom if you're pasting more rows than are shown. "
+               "(Note: column-header sorting isn't available on this table since bulk add/paste needs to stay on.)")
     save_col1, save_col2 = st.columns([1, 3])
     with save_col1:
         if st.button("💾 Save log changes", use_container_width=True, key="save_gate_log_btn"):

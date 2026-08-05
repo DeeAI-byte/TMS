@@ -11,10 +11,11 @@ from utils.data_loader import (
     build_master_table, load_assumptions, load_vehicle_database,
     cases_per_truck, best_truck_for_tonnage_limit, get_month_options,
     fleet_totals_by_ownership, simulate_daily_allocation, compute_frequency_daily_schedule,
-    allocate_trucks_by_tonnage
+    allocate_trucks_by_tonnage, require_dashboard_password
 )
 
 st.set_page_config(page_title="Fleet Calculator | Frequency Based", page_icon="📅", layout="wide")
+require_dashboard_password()
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
 st.title("📅 Monthly Fleet Calculator — Frequency Based")

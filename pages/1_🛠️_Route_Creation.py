@@ -4,11 +4,16 @@ import folium
 from streamlit_folium import st_folium
 import itertools
 import os
+import sys
 import requests
 from folium.plugins import PolyLineTextPath
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.data_loader import require_dashboard_password
+
 # Page Layout Configurations
 st.set_page_config(page_title="Interactive Logistics Router", page_icon="🛠️", layout="wide")
+require_dashboard_password()
 
 # Safe Formatting (No extra background color blocks)
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
