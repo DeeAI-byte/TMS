@@ -37,10 +37,14 @@ MANUAL_SHIPMENT_STATUS_OPTIONS = ["Pending", "Dispatched"]
 
 ALLOCATION_STATE_PATH = os.path.join(LOCAL_DATA_DIR, "allocation_state.csv")
 ALLOCATION_STATE_COLUMNS = [
-    "ShipmentKey", "Date", "Distributor", "Load (Ton)",
+    "RowKey", "ShipmentKey", "Date", "Distributor", "Load (Ton)",
     "Vehicle Number", "Truck Size (T)", "Source", "Status"
 ]
 ALLOCATION_STATUS_OPTIONS = ["Pending", "Allotted", "Dispatched"]
+SOURCE_OPTIONS = ["Own", "Fixed", "Spot Hire"]
+
+SOURCE_OVERRIDES_PATH = os.path.join(LOCAL_DATA_DIR, "source_overrides.csv")
+SOURCE_OVERRIDES_COLUMNS = ["ShipmentKey", "Source"]
 
 
 # --------------------------------------------------------------------------------------
@@ -399,7 +403,7 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
     return {largest["Vehicle"]: count}, count
 
 
-def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None, max_tonnages=None):
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None, max_tonnages=None, forced_sources=None):
     """
     Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
     total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
@@ -435,6 +439,11 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         max_tonnages: optional list, same length as loads — a per-shipment tonnage cap
             (e.g. that distributor's max allowed vehicle size). None entries mean "no
             distributor-specific cap for this shipment".
+        forced_sources: optional list, same length as loads — force a specific shipment
+            to source ONLY from "Own", "Fixed", or "Spot Hire" instead of the normal
+            Own→Fixed→Spot waterfall (None entries use the normal waterfall). Whatever a
+            forced Own/Fixed tier can't fully cover still spills to Spot Hire, same as the
+            normal waterfall's own fallback — a forced source is never left unfulfilled.
 
     Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load",
     "Source", "Distributor"}. "Load" is whatever unit was passed in via `loads` (cases,
@@ -484,6 +493,7 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         if load is None or pd.isna(load) or load <= 0:
             continue
         distributor_label = distributors[i] if distributors and i < len(distributors) else ""
+        forced = forced_sources[i] if forced_sources and i < len(forced_sources) else None
 
         # Effective cap for THIS shipment = the tighter of the global cap and this
         # shipment's own cap (e.g. a distributor's max allowed vehicle tonnage — road
@@ -600,8 +610,10 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             return max(0.0, remaining)
 
         remaining = float(load)
-        remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap, veh_block)
-        remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap, capped_veh_block)
+        if forced in (None, "Own"):
+            remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap, veh_block)
+        if remaining > 1e-6 and forced in (None, "Fixed"):
+            remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap, capped_veh_block)
 
         if remaining > 1e-6:
             # Spot Hire — no real fleet to check against, so it falls back to the standard
@@ -847,20 +859,67 @@ def save_allocation_state(df):
     for c in ALLOCATION_STATE_COLUMNS:
         if c not in df.columns:
             df[c] = ""
-    df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
+    df = df.drop_duplicates(subset=["RowKey"], keep="last")
     df = df[ALLOCATION_STATE_COLUMNS]
     df.to_csv(ALLOCATION_STATE_PATH, index=False)
     github_push_file("allocation_state.csv", df.to_csv(index=False), "Update dispatch allocation state")
 
 
 def upsert_allocation_state(rows_df):
-    """Merge new/changed shipment rows into the allocation state by ShipmentKey
-    (replacing any existing row with the same key) and persist. Returns the combined df."""
+    """Merge new/changed truck-rows into the allocation state by RowKey (one shipment can
+    have several RowKeys — one per truck — when it needs more than one; ShipmentKey alone
+    isn't unique enough to identify a single truck) and persist. Returns the combined df."""
     current = load_allocation_state()
     combined = pd.concat([current, rows_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["ShipmentKey"], keep="last").reset_index(drop=True)
+    combined = combined.drop_duplicates(subset=["RowKey"], keep="last").reset_index(drop=True)
     save_allocation_state(combined)
     return combined
+
+
+# --------------------------------------------------------------------------------------
+# SOURCE OVERRIDES — lets the office force a still-Pending shipment's suggestion to come
+# from a specific source (Own/Fixed/Spot Hire) instead of the default Own→Fixed→Spot
+# waterfall, e.g. "send this one to Spot Hire even though Own has a free truck." Keyed by
+# ShipmentKey (applies to the whole shipment, not one specific truck within a multi-truck
+# combo) and only consulted for shipments not yet Allotted.
+# --------------------------------------------------------------------------------------
+def load_source_overrides():
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    if os.path.exists(SOURCE_OVERRIDES_PATH):
+        try:
+            df = pd.read_csv(SOURCE_OVERRIDES_PATH, dtype=str).fillna("")
+            for c in SOURCE_OVERRIDES_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            return df[SOURCE_OVERRIDES_COLUMNS].reset_index(drop=True)
+        except Exception:
+            pass
+    remote = github_pull_file("source_overrides.csv")
+    if remote:
+        try:
+            from io import StringIO
+            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
+            for c in SOURCE_OVERRIDES_COLUMNS:
+                if c not in df.columns:
+                    df[c] = ""
+            df = df[SOURCE_OVERRIDES_COLUMNS].reset_index(drop=True)
+            df.to_csv(SOURCE_OVERRIDES_PATH, index=False)
+            return df
+        except Exception:
+            pass
+    return pd.DataFrame(columns=SOURCE_OVERRIDES_COLUMNS)
+
+
+def save_source_overrides(df):
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    df = df.copy()
+    for c in SOURCE_OVERRIDES_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
+    df = df[SOURCE_OVERRIDES_COLUMNS]
+    df.to_csv(SOURCE_OVERRIDES_PATH, index=False)
+    github_push_file("source_overrides.csv", df.to_csv(index=False), "Update dispatch source overrides")
 
 
 # --------------------------------------------------------------------------------------
