@@ -19,7 +19,7 @@ from utils.data_loader import (
     load_allocation_state, save_allocation_state, upsert_allocation_state,
     ALLOCATION_STATUS_OPTIONS, github_persistence_enabled,
     load_manual_shipments, save_manual_shipments, MANUAL_SHIPMENT_STATUS_OPTIONS,
-    load_source_overrides, save_source_overrides, SOURCE_OPTIONS
+    parse_flexible_date
 )
 
 st.set_page_config(page_title="Live Fleet Tracker", page_icon="📡", layout="wide")
@@ -129,7 +129,7 @@ def filter_daily_load_rows(load_log_df, planning_date):
     if date_col != "Date":
         load_log_df = load_log_df.rename(columns={date_col: "Date"})
 
-    load_log_df["Date"] = pd.to_datetime(load_log_df["Date"], errors="coerce", dayfirst=True).dt.date
+    load_log_df["Date"] = parse_flexible_date(load_log_df["Date"]).dt.date
     if "Route / Distributor" not in load_log_df.columns:
         load_log_df["Route / Distributor"] = [f"Row {i+1}" for i in range(len(load_log_df))]
 
@@ -229,7 +229,7 @@ with st.expander("🗓️ Look up the gate-out log by date range (e.g. a full mo
         range_start, range_end = picked_range
         range_df = log_df.copy()
         range_df.columns = [str(c).strip() for c in range_df.columns]
-        range_df["Gate Out Date"] = pd.to_datetime(range_df["Gate Out Date"], errors="coerce", dayfirst=True)
+        range_df["Gate Out Date"] = parse_flexible_date(range_df["Gate Out Date"])
         in_range = range_df[
             range_df["Gate Out Date"].dt.date.between(range_start, range_end)
         ].copy()
@@ -414,7 +414,7 @@ with st.container(border=True):
                         st.write(f"**Columns found:** {list(raw_preview.columns)}")
                         date_col = next((c for c in raw_preview.columns if c.strip().lower() == "date"), None)
                         if date_col:
-                            parsed_dates = pd.to_datetime(raw_preview[date_col], errors="coerce", dayfirst=True).dt.date
+                            parsed_dates = parse_flexible_date(raw_preview[date_col]).dt.date
                             unique_dates = sorted(set(d for d in parsed_dates.dropna()))
                             st.write(f"**Comparing against 'As of date':** {as_of_date}")
                             if unique_dates:
@@ -532,11 +532,6 @@ with st.container(border=True):
         if not alloc_state_all.empty else alloc_state_all
     )
     tracked_keys_today = set(alloc_state_today["ShipmentKey"]) if len(alloc_state_today) else set()
-    source_overrides_df = load_source_overrides()
-    source_override_map = (
-        dict(zip(source_overrides_df["ShipmentKey"], source_overrides_df["Source"]))
-        if len(source_overrides_df) else {}
-    )
 
     already_dispatched = already_dispatched_routes(log_df, as_of_date) if has_log_data else set()
     excluded_rows = pd.DataFrame()
@@ -586,7 +581,7 @@ with st.container(border=True):
     veh_block_tons = veh_block_tons.dropna(subset=["TonnageNum"])
     veh_block_tons["Capacity"] = veh_block_tons["TonnageNum"]
 
-    PLAN_COLS = ["RowKey", "ShipmentKey", "Vehicle Number", "Truck Size", "Load (Ton)", "Source", "Distributor", "Status"]
+    PLAN_COLS = ["ShipmentKey", "Vehicle Number", "Truck Size", "Load (Ton)", "Source", "Distributor", "Status"]
 
     # --- Shipments already Allotted or Dispatched today: pull their FIXED vehicle from
     # the saved state — never recomputed, never reassigned to a different shipment.
@@ -619,16 +614,13 @@ with st.container(border=True):
     suggested_rows = []
     for _, srow in pending_rows_df.iterrows():
         single_cap = _dist_cap_lookup.get(str(srow["Route / Distributor"]).strip().casefold())
-        forced = source_override_map.get(srow["ShipmentKey"])
         result = allocate_shipments_to_fleet(
             [srow["Load (Ton)"]], current_fleet_pool, veh_block_tons,
             buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
-            distributors=[srow["Route / Distributor"]], max_tonnages=[single_cap],
-            forced_sources=[forced]
+            distributors=[srow["Route / Distributor"]], max_tonnages=[single_cap]
         )
-        for truck_idx, r in enumerate(result):
+        for r in result:
             r["ShipmentKey"] = srow["ShipmentKey"]
-            r["RowKey"] = f"{srow['ShipmentKey']}::{truck_idx}"
             r["Status"] = "Pending"
             suggested_rows.append(r)
             if r["Source"] in ("Own", "Fixed"):
@@ -665,20 +657,12 @@ with st.container(border=True):
     if trucks_needed_today > 0:
         st.caption("Change **Status** below: **Allotted** fixes that suggested vehicle to this shipment "
                    "(no more re-suggesting it elsewhere); **Dispatched** logs it into the Vehicle Out log "
-                   "above right away. Includes Spot Hire (shown as **market** in Vehicle Number). "
-                   "You can also change **Source** — on a still-Pending row this sets a preference for its "
-                   "next suggestion; on an already-Allotted row it swaps the real vehicle out and frees it "
-                   "back up immediately (e.g. system suggested Own, but you need to send it Spot Hire instead). "
-                   "A multi-truck shipment's rows share the same shipment, so changing Status on any one of "
-                   "them moves the whole shipment together.")
+                   "above right away. Includes Spot Hire (shown as **market** in Vehicle Number).")
         edited_plan_df = st.data_editor(
             plan_df, use_container_width=True, hide_index=True, key="dispatch_status_editor",
             column_order=["Distributor", "Load (Ton)", "Truck Size", "Vehicle Number", "Source", "Status"],
-            disabled=["Distributor", "Load (Ton)", "Truck Size", "Vehicle Number"],
-            column_config={
-                "Status": st.column_config.SelectboxColumn(options=ALLOCATION_STATUS_OPTIONS),
-                "Source": st.column_config.SelectboxColumn(options=SOURCE_OPTIONS),
-            }
+            disabled=["Distributor", "Load (Ton)", "Truck Size", "Vehicle Number", "Source"],
+            column_config={"Status": st.column_config.SelectboxColumn(options=ALLOCATION_STATUS_OPTIONS)}
         )
         if spot_needed_today > 0:
             st.warning(f"⚠️ Arrange **{spot_needed_today} spot hire vehicles** today — your Own/Fixed fleet "
@@ -690,104 +674,29 @@ with st.container(border=True):
                        "No spot hire required.")
 
         if st.button("✅ Apply Status Changes", use_container_width=True, key="apply_status_btn"):
-            working = edited_plan_df.reset_index(drop=True).copy()
-            original = plan_df.reset_index(drop=True)
-
-            # ---------- STEP 1: Source changes ----------
-            # A still-Pending row's Source is just today's live suggestion — changing it
-            # saves a standing preference for its NEXT suggestion (nothing to release yet).
-            # An already-Allotted row has a REAL vehicle locked in — changing its Source
-            # swaps that vehicle out right away and frees it back to the pool (nothing else
-            # references its Vehicle Number afterwards, so it's simply available again).
-            reassign_failed = []
-            pending_source_overrides = {}
-            for i in range(len(working)):
-                row = working.loc[i]
-                if row["Source"] == original.loc[i, "Source"]:
-                    continue  # untouched
-
-                row_key, shipment_key = row["RowKey"], row["ShipmentKey"]
-                prev_rows = alloc_state_today[alloc_state_today["RowKey"] == row_key] if len(alloc_state_today) else pd.DataFrame()
-                prev_status = prev_rows["Status"].iloc[0] if len(prev_rows) else "Pending"
-
-                if prev_status == "Dispatched":
-                    continue  # already gone — Source can't be changed from here
-
-                if prev_status == "Pending":
-                    pending_source_overrides[shipment_key] = row["Source"]
-                    continue
-
-                # prev_status == "Allotted" — a real vehicle IS currently locked in.
-                if row["Source"] == "Spot Hire":
-                    working.loc[i, "Vehicle Number"] = "(market)"
-                    # Truck Size stays — still reflects this shipment's size need.
-                else:
-                    single_cap = _dist_cap_lookup.get(str(row["Distributor"]).strip().casefold())
-                    reassign = allocate_shipments_to_fleet(
-                        [row["Load (Ton)"]], current_fleet_pool, veh_block_tons,
-                        buffer=buffer_tons_live, max_tonnage=max_tonnage_live if max_tonnage_live > 0 else None,
-                        distributors=[row["Distributor"]], max_tonnages=[single_cap],
-                        forced_sources=[row["Source"]]
-                    )
-                    if len(reassign) == 1 and reassign[0]["Source"] == row["Source"]:
-                        working.loc[i, "Vehicle Number"] = reassign[0]["Vehicle Number"]
-                        working.loc[i, "Truck Size"] = reassign[0]["Truck Size"]
-                    else:
-                        reassign_failed.append(f"{row['Distributor']} ({row['Load (Ton)']:g}T → {row['Source']})")
-                        working.loc[i, "Source"] = original.loc[i, "Source"]  # couldn't honor it — revert
-
-            if pending_source_overrides:
-                ov_current = load_source_overrides()
-                ov_map = dict(zip(ov_current["ShipmentKey"], ov_current["Source"])) if len(ov_current) else {}
-                ov_map.update(pending_source_overrides)
-                save_source_overrides(pd.DataFrame({
-                    "ShipmentKey": list(ov_map.keys()), "Source": list(ov_map.values())
-                }))
-
-            if reassign_failed:
-                st.warning(
-                    f"⚠️ Couldn't switch source for: {', '.join(reassign_failed)} — no available vehicle of "
-                    f"that type covers the full load right now. Kept the original vehicle for those; try "
-                    f"Spot Hire instead, or check Available Vehicles."
-                )
-
-            # ---------- STEP 2: Status changes, propagated across the whole shipment ----------
-            # A multi-truck shipment's rows all share one ShipmentKey — flipping Status on
-            # ANY one of them now moves every truck in that shipment together, so you never
-            # end up with one truck Allotted and its sibling still sitting Pending.
-            STATUS_RANK = {"Pending": 0, "Allotted": 1, "Dispatched": 2}
-            RANK_STATUS = {0: "Pending", 1: "Allotted", 2: "Dispatched"}
-            working["_Rank"] = working["Status"].map(STATUS_RANK).fillna(0)
-            working["_TargetStatus"] = working.groupby("ShipmentKey")["_Rank"].transform("max").map(RANK_STATUS)
-
             new_state_rows = []
             gate_out_new_entries = []
             revert_keys = []
             blocked_any = False
-            for i in range(len(working)):
-                row = working.loc[i]
-                row_key, shipment_key = row["RowKey"], row["ShipmentKey"]
-                prev_rows = alloc_state_today[alloc_state_today["RowKey"] == row_key] if len(alloc_state_today) else pd.DataFrame()
-                prev_status = prev_rows["Status"].iloc[0] if len(prev_rows) else "Pending"
-                target_status = row["_TargetStatus"]
-
+            for _, row in edited_plan_df.iterrows():
+                key = row["ShipmentKey"]
+                _prev = alloc_state_today.loc[alloc_state_today["ShipmentKey"] == key, "Status"] if len(alloc_state_today) else pd.Series(dtype=str)
+                prev_status = _prev.iloc[0] if len(_prev) else "Pending"
+                new_status = row["Status"]
+                if new_status == prev_status:
+                    continue
                 if prev_status == "Dispatched":
-                    if target_status != "Dispatched":
-                        blocked_any = True
+                    blocked_any = True
                     continue
-                if target_status == prev_status:
+                if new_status == "Pending":
+                    revert_keys.append(key)
                     continue
-                if target_status == "Pending":
-                    revert_keys.append(shipment_key)
-                    continue
-
                 new_state_rows.append({
-                    "RowKey": row_key, "ShipmentKey": shipment_key, "Date": today_str,
-                    "Distributor": row["Distributor"], "Load (Ton)": row["Load (Ton)"],
-                    "Vehicle Number": row["Vehicle Number"], "Truck Size (T)": row["Truck Size"],
-                    "Source": row["Source"], "Status": target_status,
+                    "ShipmentKey": key, "Date": today_str, "Distributor": row["Distributor"],
+                    "Load (Ton)": row["Load (Ton)"], "Vehicle Number": row["Vehicle Number"],
+                    "Truck Size (T)": row["Truck Size"], "Source": row["Source"], "Status": new_status,
                 })
-                if target_status == "Dispatched":
+                if new_status == "Dispatched":
                     gate_out_new_entries.append({
                         "Vehicle Number": row["Vehicle Number"], "Ownership": row["Source"],
                         "Truck Size (T)": row["Truck Size"], "Gate Out Date": today_str,
@@ -808,10 +717,10 @@ with st.container(border=True):
             if blocked_any:
                 st.warning("Some rows were already Dispatched and can't be changed here — edit the "
                            "Vehicle Out log above directly if you need to correct one.")
-            if new_state_rows or gate_out_new_entries or revert_keys or pending_source_overrides:
+            if new_state_rows or gate_out_new_entries or revert_keys:
                 st.success("Updated.")
                 st.rerun()
-            elif not reassign_failed:
+            else:
                 st.info("No changes to apply.")
 
 st.write("---")
