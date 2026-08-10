@@ -1,4 +1,2 @@
 RowKey,ShipmentKey,Date,Distributor,Load (Ton),Vehicle Number,Truck Size (T),Source,Status
 ,2026-08-08|Metro CashNcarry|23.0|0,2026-08-08,Metro CashNcarry,23.0,UP33AT4876,7T,Own,
-2026-08-10|Usha Enterprises|5.0|0::0,2026-08-10|Usha Enterprises|5.0|0,2026-08-10,Usha Enterprises,5.0,UP32CZ1713,4T,Spot Hire,Allotted
-2026-08-10|A To Z Enterprises|18.0|0::0,2026-08-10|A To Z Enterprises|18.0|0,2026-08-10,A To Z Enterprises,18.0,(market),18T,Spot Hire,Allotted
