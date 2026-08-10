@@ -1,2 +1,3 @@
-RowKey,ShipmentKey,Date,Distributor,Load (Ton),Vehicle Number,Truck Size (T),Source,Status
-,2026-08-08|Metro CashNcarry|23.0|0,2026-08-08,Metro CashNcarry,23.0,UP33AT4876,7T,Own,
+ShipmentKey,Date,Distributor,Load (Ton),Vehicle Number,Truck Size (T),Source,Status
+2026-08-08|Metro CashNcarry|23.0|0,2026-08-08,Metro CashNcarry,23.0,UP33AT4876,7T,Own,
+2026-08-10|Akash Traders|8.0|0,2026-08-10,Akash Traders,8.0,UP32CZ1716,4T,Own,Allotted
