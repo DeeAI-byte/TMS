@@ -37,14 +37,10 @@ MANUAL_SHIPMENT_STATUS_OPTIONS = ["Pending", "Dispatched"]
 
 ALLOCATION_STATE_PATH = os.path.join(LOCAL_DATA_DIR, "allocation_state.csv")
 ALLOCATION_STATE_COLUMNS = [
-    "RowKey", "ShipmentKey", "Date", "Distributor", "Load (Ton)",
+    "ShipmentKey", "Date", "Distributor", "Load (Ton)",
     "Vehicle Number", "Truck Size (T)", "Source", "Status"
 ]
 ALLOCATION_STATUS_OPTIONS = ["Pending", "Allotted", "Dispatched"]
-SOURCE_OPTIONS = ["Own", "Fixed", "Spot Hire"]
-
-SOURCE_OVERRIDES_PATH = os.path.join(LOCAL_DATA_DIR, "source_overrides.csv")
-SOURCE_OVERRIDES_COLUMNS = ["ShipmentKey", "Source"]
 
 
 # --------------------------------------------------------------------------------------
@@ -144,6 +140,32 @@ def github_push_file(filename, content_str, message):
         return put_resp.status_code in (200, 201)
     except Exception:
         return False
+
+
+def parse_flexible_date(series):
+    """Parses a column that may contain a mix of stored ISO dates (YYYY-MM-DD) and
+    user-typed/pasted DD-MM-YYYY or DD/MM/YYYY text.
+
+    This exists because pandas' own vectorized pd.to_datetime(series, dayfirst=True) is
+    NOT safe on a column of ISO-format strings — it can silently swap month and day (e.g.
+    2026-08-10 becomes 2026-10-08) even though ISO has no ambiguity to resolve, because
+    the vectorized parser still applies dayfirst-style swapping to the batch. This
+    corrupted 'Gate Out Date' silently, which broke the entire currently-out calculation
+    (a gate-out date parsed into next month reads as 'not out yet'). ISO strings are
+    detected and parsed literally first (no ambiguity, no dayfirst involved at all);
+    everything else is parsed one value at a time with dayfirst=True, avoiding pandas'
+    per-batch format inference entirely."""
+    s = series.astype(str).str.strip()
+    iso_mask = s.str.match(r'^\d{4}-\d{2}-\d{2}$')
+    result = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(s[iso_mask], format='%Y-%m-%d', errors='coerce')
+    other_mask = ~iso_mask & s.ne('') & s.ne('nan') & s.ne('NaT')
+    if other_mask.any():
+        result.loc[other_mask] = s[other_mask].apply(
+            lambda v: pd.to_datetime(v, dayfirst=True, errors='coerce')
+        )
+    return result
 
 
 def format_truck_size(value):
@@ -403,7 +425,7 @@ def allocate_trucks_by_tonnage(load, veh_block, max_tonnage=None, buffer=0, max_
     return {largest["Vehicle"]: count}, count
 
 
-def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None, max_tonnages=None, forced_sources=None):
+def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max_tonnage=None, distributors=None, max_tonnages=None):
     """
     Matches a list of INDIVIDUAL shipment loads (one per distributor/route — not one lump
     total) against your ACTUAL available fleet, vehicle by vehicle. This is what catches
@@ -439,11 +461,6 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         max_tonnages: optional list, same length as loads — a per-shipment tonnage cap
             (e.g. that distributor's max allowed vehicle size). None entries mean "no
             distributor-specific cap for this shipment".
-        forced_sources: optional list, same length as loads — force a specific shipment
-            to source ONLY from "Own", "Fixed", or "Spot Hire" instead of the normal
-            Own→Fixed→Spot waterfall (None entries use the normal waterfall). Whatever a
-            forced Own/Fixed tier can't fully cover still spills to Spot Hire, same as the
-            normal waterfall's own fallback — a forced source is never left unfulfilled.
 
     Returns a list of per-shipment dicts: {"Vehicle Number", "Truck Size", "Load",
     "Source", "Distributor"}. "Load" is whatever unit was passed in via `loads` (cases,
@@ -493,7 +510,6 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
         if load is None or pd.isna(load) or load <= 0:
             continue
         distributor_label = distributors[i] if distributors and i < len(distributors) else ""
-        forced = forced_sources[i] if forced_sources and i < len(forced_sources) else None
 
         # Effective cap for THIS shipment = the tighter of the global cap and this
         # shipment's own cap (e.g. a distributor's max allowed vehicle tonnage — road
@@ -610,10 +626,8 @@ def allocate_shipments_to_fleet(loads, fleet_status_df, veh_block, buffer=0, max
             return max(0.0, remaining)
 
         remaining = float(load)
-        if forced in (None, "Own"):
-            remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap, veh_block)
-        if remaining > 1e-6 and forced in (None, "Fixed"):
-            remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap, capped_veh_block)
+        remaining = assign_from_real_pool(remaining, own_pool, "Own", shipment_cap, veh_block)
+        remaining = assign_from_real_pool(remaining, fixed_pool, "Fixed", shipment_fixed_spot_cap, capped_veh_block)
 
         if remaining > 1e-6:
             # Spot Hire — no real fleet to check against, so it falls back to the standard
@@ -859,67 +873,20 @@ def save_allocation_state(df):
     for c in ALLOCATION_STATE_COLUMNS:
         if c not in df.columns:
             df[c] = ""
-    df = df.drop_duplicates(subset=["RowKey"], keep="last")
+    df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
     df = df[ALLOCATION_STATE_COLUMNS]
     df.to_csv(ALLOCATION_STATE_PATH, index=False)
     github_push_file("allocation_state.csv", df.to_csv(index=False), "Update dispatch allocation state")
 
 
 def upsert_allocation_state(rows_df):
-    """Merge new/changed truck-rows into the allocation state by RowKey (one shipment can
-    have several RowKeys — one per truck — when it needs more than one; ShipmentKey alone
-    isn't unique enough to identify a single truck) and persist. Returns the combined df."""
+    """Merge new/changed shipment rows into the allocation state by ShipmentKey
+    (replacing any existing row with the same key) and persist. Returns the combined df."""
     current = load_allocation_state()
     combined = pd.concat([current, rows_df], ignore_index=True)
-    combined = combined.drop_duplicates(subset=["RowKey"], keep="last").reset_index(drop=True)
+    combined = combined.drop_duplicates(subset=["ShipmentKey"], keep="last").reset_index(drop=True)
     save_allocation_state(combined)
     return combined
-
-
-# --------------------------------------------------------------------------------------
-# SOURCE OVERRIDES — lets the office force a still-Pending shipment's suggestion to come
-# from a specific source (Own/Fixed/Spot Hire) instead of the default Own→Fixed→Spot
-# waterfall, e.g. "send this one to Spot Hire even though Own has a free truck." Keyed by
-# ShipmentKey (applies to the whole shipment, not one specific truck within a multi-truck
-# combo) and only consulted for shipments not yet Allotted.
-# --------------------------------------------------------------------------------------
-def load_source_overrides():
-    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-    if os.path.exists(SOURCE_OVERRIDES_PATH):
-        try:
-            df = pd.read_csv(SOURCE_OVERRIDES_PATH, dtype=str).fillna("")
-            for c in SOURCE_OVERRIDES_COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[SOURCE_OVERRIDES_COLUMNS].reset_index(drop=True)
-        except Exception:
-            pass
-    remote = github_pull_file("source_overrides.csv")
-    if remote:
-        try:
-            from io import StringIO
-            df = pd.read_csv(StringIO(remote), dtype=str).fillna("")
-            for c in SOURCE_OVERRIDES_COLUMNS:
-                if c not in df.columns:
-                    df[c] = ""
-            df = df[SOURCE_OVERRIDES_COLUMNS].reset_index(drop=True)
-            df.to_csv(SOURCE_OVERRIDES_PATH, index=False)
-            return df
-        except Exception:
-            pass
-    return pd.DataFrame(columns=SOURCE_OVERRIDES_COLUMNS)
-
-
-def save_source_overrides(df):
-    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-    df = df.copy()
-    for c in SOURCE_OVERRIDES_COLUMNS:
-        if c not in df.columns:
-            df[c] = ""
-    df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
-    df = df[SOURCE_OVERRIDES_COLUMNS]
-    df.to_csv(SOURCE_OVERRIDES_PATH, index=False)
-    github_push_file("source_overrides.csv", df.to_csv(index=False), "Update dispatch source overrides")
 
 
 # --------------------------------------------------------------------------------------
@@ -950,9 +917,9 @@ def process_gate_out_log(df, as_of_date):
     d["Ownership"] = d["Ownership"].astype(str).str.strip().str.title()
     if "Route / Distributor" in d.columns:
         d["Route / Distributor"] = d["Route / Distributor"].astype(str).str.strip()
-    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
+    d["Gate Out Date"] = parse_flexible_date(d["Gate Out Date"])
     if "Actual Return Date" in d.columns:
-        d["Actual Return Date"] = pd.to_datetime(d["Actual Return Date"], errors="coerce", dayfirst=True)
+        d["Actual Return Date"] = parse_flexible_date(d["Actual Return Date"])
     else:
         d["Actual Return Date"] = pd.NaT
 
@@ -1010,7 +977,7 @@ def already_dispatched_routes(log_df, as_of_date):
         return set()
 
     d = d.replace(r'^\s*$', pd.NA, regex=True)
-    d["Gate Out Date"] = pd.to_datetime(d["Gate Out Date"], errors="coerce", dayfirst=True)
+    d["Gate Out Date"] = parse_flexible_date(d["Gate Out Date"])
     as_of_timestamp = pd.to_datetime(as_of_date)
 
     matched = d[
