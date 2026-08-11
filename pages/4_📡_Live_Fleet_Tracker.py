@@ -694,11 +694,13 @@ with st.container(border=True):
             original = plan_df.reset_index(drop=True)
 
             # ---------- STEP 1: Source changes ----------
-            # A still-Pending row's Source is just today's live suggestion — changing it
-            # saves a standing preference for its NEXT suggestion (nothing to release yet).
-            # An already-Allotted row has a REAL vehicle locked in — changing its Source
-            # swaps that vehicle out right away and frees it back to the pool (nothing else
-            # references its Vehicle Number afterwards, so it's simply available again).
+            # Whenever Source is changed, reassign THIS row's vehicle immediately — not just
+            # for already-Allotted rows. Otherwise, changing Source and Status (→ Allotted)
+            # in the same click locks the shipment in using the stale, previously-suggested
+            # vehicle number alongside the new Source, e.g. "Source: Spot Hire, Vehicle
+            # Number: <the old Own truck>". We also still save this as a standing preference
+            # so a shipment left Pending (not locked in this same click) keeps honoring it
+            # on its next suggestion too.
             reassign_failed = []
             pending_source_overrides = {}
             for i in range(len(working)):
@@ -713,14 +715,10 @@ with st.container(border=True):
                 if prev_status == "Dispatched":
                     continue  # already gone — Source can't be changed from here
 
-                if prev_status == "Pending":
-                    pending_source_overrides[shipment_key] = row["Source"]
-                    continue
-
-                # prev_status == "Allotted" — a real vehicle IS currently locked in.
                 if row["Source"] == "Spot Hire":
                     working.loc[i, "Vehicle Number"] = "(market)"
                     # Truck Size stays — still reflects this shipment's size need.
+                    pending_source_overrides[shipment_key] = row["Source"]
                 else:
                     single_cap = _dist_cap_lookup.get(str(row["Distributor"]).strip().casefold())
                     reassign = allocate_shipments_to_fleet(
@@ -732,6 +730,7 @@ with st.container(border=True):
                     if len(reassign) == 1 and reassign[0]["Source"] == row["Source"]:
                         working.loc[i, "Vehicle Number"] = reassign[0]["Vehicle Number"]
                         working.loc[i, "Truck Size"] = reassign[0]["Truck Size"]
+                        pending_source_overrides[shipment_key] = row["Source"]
                     else:
                         reassign_failed.append(f"{row['Distributor']} ({row['Load (Ton)']:g}T → {row['Source']})")
                         working.loc[i, "Source"] = original.loc[i, "Source"]  # couldn't honor it — revert
@@ -775,11 +774,18 @@ with st.container(border=True):
                     if target_status != "Dispatched":
                         blocked_any = True
                     continue
-                if target_status == prev_status:
-                    continue
                 if target_status == "Pending":
                     revert_keys.append(shipment_key)
                     continue
+
+                # A Source swap in Step 1 (e.g. Own → Spot Hire) changes Vehicle Number
+                # without necessarily changing Status — that still needs to be written to
+                # state, or it silently reverts to the old vehicle on the next render.
+                prev_vehicle = prev_rows["Vehicle Number"].iloc[0] if len(prev_rows) else None
+                prev_source = prev_rows["Source"].iloc[0] if len(prev_rows) else None
+                reassigned = (row["Vehicle Number"] != prev_vehicle) or (row["Source"] != prev_source)
+                if target_status == prev_status and not reassigned:
+                    continue  # truly nothing changed for this row
 
                 new_state_rows.append({
                     "RowKey": row_key, "ShipmentKey": shipment_key, "Date": today_str,
@@ -787,7 +793,7 @@ with st.container(border=True):
                     "Vehicle Number": row["Vehicle Number"], "Truck Size (T)": row["Truck Size"],
                     "Source": row["Source"], "Status": target_status,
                 })
-                if target_status == "Dispatched":
+                if target_status == "Dispatched" and prev_status != "Dispatched":
                     gate_out_new_entries.append({
                         "Vehicle Number": row["Vehicle Number"], "Ownership": row["Source"],
                         "Truck Size (T)": row["Truck Size"], "Gate Out Date": today_str,
