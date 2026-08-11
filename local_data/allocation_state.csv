@@ -1,2 +1,5 @@
 RowKey,ShipmentKey,Date,Distributor,Load (Ton),Vehicle Number,Truck Size (T),Source,Status
 ,"2026-08-10|MANSOORI ELECTRONICS,(HUB) TANDIYAWAN|3.6|0",2026-08-10,"MANSOORI ELECTRONICS,(HUB) TANDIYAWAN",3.6,UP32NN0825,4.2T,Own,Allotted
+2026-08-11|A J Agencies|34.0|0::0,2026-08-11|A J Agencies|34.0|0,2026-08-11,A J Agencies,34.0,UP41T3829,15T,Own,Allotted
+2026-08-11|A J Agencies|34.0|0::1,2026-08-11|A J Agencies|34.0|0,2026-08-11,A J Agencies,34.0,UP41AT0521,9T,Own,Allotted
+2026-08-11|A J Agencies|34.0|0::2,2026-08-11|A J Agencies|34.0|0,2026-08-11,A J Agencies,34.0,UP30T2343,7T,Own,Allotted
