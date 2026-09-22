@@ -124,11 +124,11 @@ def github_pull_file(filename):
 
 
 def github_push_file(filename, content_str, message):
-    """Commits a file's new content to the repo (creating or updating it). Best-effort —
-    failures are swallowed so the app keeps working off local disk even if the commit
-    fails (e.g. bad token, offline, rate limit)."""
+    """Commits a file's new content to the repo (creating or updating it). Returns
+    (success: bool, error: str|None) — never raises, but no longer swallows WHY a push
+    failed, so callers can surface it instead of showing a false 'Saved.'"""
     if not github_persistence_enabled():
-        return False
+        return False, None  # not configured — not an error, just inactive
     try:
         url = _github_api_url(filename)
         get_resp = requests.get(url, headers=_github_headers(), params={"ref": GITHUB_BRANCH}, timeout=10)
@@ -141,9 +141,15 @@ def github_push_file(filename, content_str, message):
         if sha:
             payload["sha"] = sha
         put_resp = requests.put(url, headers=_github_headers(), json=payload, timeout=10)
-        return put_resp.status_code in (200, 201)
-    except Exception:
-        return False
+        if put_resp.status_code in (200, 201):
+            return True, None
+        try:
+            err = put_resp.json().get("message", f"HTTP {put_resp.status_code}")
+        except Exception:
+            err = f"HTTP {put_resp.status_code}"
+        return False, err
+    except Exception as e:
+        return False, str(e)
 
 
 def parse_flexible_date(series):
@@ -704,14 +710,15 @@ def save_gate_out_log_local(df):
             df[c] = ""
     df = df[GATE_OUT_LOG_COLUMNS]
     df.to_csv(GATE_OUT_LOG_PATH, index=False)
-    github_push_file("gate_out_log.csv", df.to_csv(index=False), "Update Vehicle Out log")
+    return github_push_file("gate_out_log.csv", df.to_csv(index=False), "Update Vehicle Out log")
 
 
 def append_gate_out_entries(new_rows_df, dedupe=True):
     """Appends newly-allotted vehicles (from Today's Load, or an imported sheet) to the
-    local Vehicle Out log and persists it. Returns the combined dataframe. Exact-duplicate
-    rows (same vehicle/ownership/size/dates/distributor) are dropped by default so
-    re-clicking Confirm or Import doesn't double-log the same gate-out."""
+    local Vehicle Out log and persists it. Returns (combined_df, pushed, error) — pushed/
+    error reflect whether the GitHub backup succeeded, so a caller can warn if it didn't.
+    Exact-duplicate rows (same vehicle/ownership/size/dates/distributor) are dropped by
+    default so re-clicking Confirm or Import doesn't double-log the same gate-out."""
     current = load_gate_out_log_local()
     new_rows_df = new_rows_df.copy()
     for c in GATE_OUT_LOG_COLUMNS:
@@ -720,8 +727,8 @@ def append_gate_out_entries(new_rows_df, dedupe=True):
     combined = pd.concat([current, new_rows_df[GATE_OUT_LOG_COLUMNS]], ignore_index=True)
     if dedupe:
         combined = combined.drop_duplicates(keep="first").reset_index(drop=True)
-    save_gate_out_log_local(combined)
-    return combined
+    pushed, err = save_gate_out_log_local(combined)
+    return combined, pushed, err
 
 
 # --------------------------------------------------------------------------------------
@@ -781,7 +788,7 @@ def save_vehicle_status_overrides(df):
     df = df.drop_duplicates(subset=["Vehicle Number"], keep="last")
     df = df[VEHICLE_STATUS_COLUMNS]
     df.to_csv(VEHICLE_STATUS_OVERRIDES_PATH, index=False)
-    github_push_file("vehicle_status_overrides.csv", df.to_csv(index=False), "Update vehicle status overrides")
+    return github_push_file("vehicle_status_overrides.csv", df.to_csv(index=False), "Update vehicle status overrides")
 
 
 def apply_vehicle_status_overrides(veh_db, overrides_df):
@@ -843,7 +850,7 @@ def save_manual_shipments(df):
             df[c] = ""
     df = df[MANUAL_SHIPMENTS_COLUMNS]
     df.to_csv(MANUAL_SHIPMENTS_PATH, index=False)
-    github_push_file("manual_shipments.csv", df.to_csv(index=False), "Update manually-entered shipments")
+    return github_push_file("manual_shipments.csv", df.to_csv(index=False), "Update manually-entered shipments")
 
 
 # --------------------------------------------------------------------------------------
@@ -888,18 +895,19 @@ def save_allocation_state(df):
     df = df.drop_duplicates(subset=["RowKey"], keep="last")
     df = df[ALLOCATION_STATE_COLUMNS]
     df.to_csv(ALLOCATION_STATE_PATH, index=False)
-    github_push_file("allocation_state.csv", df.to_csv(index=False), "Update dispatch allocation state")
+    return github_push_file("allocation_state.csv", df.to_csv(index=False), "Update dispatch allocation state")
 
 
 def upsert_allocation_state(rows_df):
     """Merge new/changed truck-rows into the allocation state by RowKey (one shipment can
     have several RowKeys — one per truck — when it needs more than one; ShipmentKey alone
-    isn't unique enough to identify a single truck) and persist. Returns the combined df."""
+    isn't unique enough to identify a single truck) and persist. Returns (combined_df,
+    pushed, error) — pushed/error reflect whether the GitHub backup succeeded."""
     current = load_allocation_state()
     combined = pd.concat([current, rows_df], ignore_index=True)
     combined = combined.drop_duplicates(subset=["RowKey"], keep="last").reset_index(drop=True)
-    save_allocation_state(combined)
-    return combined
+    pushed, err = save_allocation_state(combined)
+    return combined, pushed, err
 
 
 # --------------------------------------------------------------------------------------
@@ -945,7 +953,7 @@ def save_source_overrides(df):
     df = df.drop_duplicates(subset=["ShipmentKey"], keep="last")
     df = df[SOURCE_OVERRIDES_COLUMNS]
     df.to_csv(SOURCE_OVERRIDES_PATH, index=False)
-    github_push_file("source_overrides.csv", df.to_csv(index=False), "Update dispatch source overrides")
+    return github_push_file("source_overrides.csv", df.to_csv(index=False), "Update dispatch source overrides")
 
 
 # --------------------------------------------------------------------------------------
