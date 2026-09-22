@@ -30,6 +30,22 @@ st.caption("Cross-references your transport office's gate-out log against your a
            "real available Own/Fixed fleet, right now, plus today's load → trucks → spot hire in one place.")
 st.write("---")
 
+
+def warn_if_push_failed(pushed, err):
+    """Call after any save that returns a (pushed, err) GitHub status. If persistence is
+    configured but this particular push failed, says so loudly — this used to fail
+    silently, so a save could look successful while quietly only living on local disk,
+    then vanish on the next sleep/wake or redeploy."""
+    if github_persistence_enabled() and not pushed:
+        st.error(
+            f"⚠️ Saved locally, but the **GitHub backup failed** ({err or 'unknown error'}) — "
+            f"this change will be **lost on the next reboot/sleep-wake** until this is fixed. "
+            f"Double-check `github_token` (not expired, has Contents: Read and write) and "
+            f"`github_repo` in Settings → Secrets."
+        )
+
+
+
 try:
     veh_db = load_vehicle_database()
     status_overrides_df = load_vehicle_status_overrides()
@@ -475,9 +491,12 @@ with st.container(border=True):
         }
     )
     if st.button("💾 Save manual shipments", key="save_manual_shipments_btn"):
-        save_manual_shipments(edited_manual_shipments_df)
-        st.success("Saved.")
-        st.rerun()
+        pushed, err = save_manual_shipments(edited_manual_shipments_df)
+        if github_persistence_enabled() and not pushed:
+            warn_if_push_failed(pushed, err)
+        else:
+            st.success("Saved.")
+            st.rerun()
 
     manual_valid_df = edited_manual_shipments_df[
         edited_manual_shipments_df["Route / Distributor"].astype(str).str.strip().ne("") &
@@ -735,13 +754,16 @@ with st.container(border=True):
                         reassign_failed.append(f"{row['Distributor']} ({row['Load (Ton)']:g}T → {row['Source']})")
                         working.loc[i, "Source"] = original.loc[i, "Source"]  # couldn't honor it — revert
 
+            push_warnings = []
             if pending_source_overrides:
                 ov_current = load_source_overrides()
                 ov_map = dict(zip(ov_current["ShipmentKey"], ov_current["Source"])) if len(ov_current) else {}
                 ov_map.update(pending_source_overrides)
-                save_source_overrides(pd.DataFrame({
+                pushed, err = save_source_overrides(pd.DataFrame({
                     "ShipmentKey": list(ov_map.keys()), "Source": list(ov_map.values())
                 }))
+                if github_persistence_enabled() and not pushed:
+                    push_warnings.append(f"source preferences ({err})")
 
             if reassign_failed:
                 st.warning(
@@ -802,19 +824,31 @@ with st.container(border=True):
                     })
 
             if revert_keys:
-                save_allocation_state(alloc_state_all[~alloc_state_all["ShipmentKey"].isin(revert_keys)])
+                pushed, err = save_allocation_state(alloc_state_all[~alloc_state_all["ShipmentKey"].isin(revert_keys)])
+                if github_persistence_enabled() and not pushed:
+                    push_warnings.append(f"reverted shipments ({err})")
             if new_state_rows:
-                upsert_allocation_state(pd.DataFrame(new_state_rows))
+                _, pushed, err = upsert_allocation_state(pd.DataFrame(new_state_rows))
+                if github_persistence_enabled() and not pushed:
+                    push_warnings.append(f"dispatch status ({err})")
             if gate_out_new_entries:
                 # dedupe=False: Spot Hire rows can legitimately repeat the same "(market)"
                 # vehicle number + size + distributor for genuinely separate trucks, which
                 # a blanket duplicate-row check would wrongly collapse.
-                append_gate_out_entries(pd.DataFrame(gate_out_new_entries), dedupe=False)
+                _, pushed, err = append_gate_out_entries(pd.DataFrame(gate_out_new_entries), dedupe=False)
+                if github_persistence_enabled() and not pushed:
+                    push_warnings.append(f"Vehicle Out log ({err})")
 
             if blocked_any:
                 st.warning("Some rows were already Dispatched and can't be changed here — edit the "
                            "Vehicle Out log above directly if you need to correct one.")
-            if new_state_rows or gate_out_new_entries or revert_keys or pending_source_overrides:
+            if push_warnings:
+                st.error(
+                    f"⚠️ Saved locally, but the **GitHub backup failed** for: {'; '.join(push_warnings)} — "
+                    f"these changes will be **lost on the next reboot/sleep-wake** until fixed. Check "
+                    f"`github_token`/`github_repo` in Settings → Secrets."
+                )
+            elif new_state_rows or gate_out_new_entries or revert_keys or pending_source_overrides:
                 st.success("Updated.")
                 st.rerun()
             elif not reassign_failed:
@@ -845,9 +879,12 @@ with c1:
         if st.button("💾 Save status changes", key="save_vehicle_status_btn"):
             changed = edited_avail[["Vehicle Number", "Remarks"]].copy()
             merged_overrides = pd.concat([status_overrides_df, changed], ignore_index=True)
-            save_vehicle_status_overrides(merged_overrides)
-            st.success("Saved — statuses updated.")
-            st.rerun()
+            pushed, err = save_vehicle_status_overrides(merged_overrides)
+            if github_persistence_enabled() and not pushed:
+                warn_if_push_failed(pushed, err)
+            else:
+                st.success("Saved — statuses updated.")
+                st.rerun()
     else:
         edited_avail = avail_show
         st.dataframe(avail_show, use_container_width=True, height=320, hide_index=True)
@@ -917,9 +954,12 @@ with c2:
             to_save = edited_log_df.copy()
             to_save["Gate Out Date"] = pd.to_datetime(to_save["Gate Out Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
             to_save["Actual Return Date"] = pd.to_datetime(to_save["Actual Return Date"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-            save_gate_out_log_local(to_save)
-            st.success("Saved.")
-            st.rerun()
+            pushed, err = save_gate_out_log_local(to_save)
+            if github_persistence_enabled() and not pushed:
+                warn_if_push_failed(pushed, err)  # stay on this render so the error is visible
+            else:
+                st.success("Saved.")
+                st.rerun()
     with save_col2:
         st.caption("⚠️ Saved locally on this deployment (may reset on redeploy).")
     st.download_button("⬇️ Download Vehicle Out log (CSV)", edited_log_df.to_csv(index=False).encode("utf-8"),
