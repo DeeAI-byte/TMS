@@ -25,7 +25,7 @@ st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem
 REFRESH_SECONDS = 60
 
 st.title("🛰️ Live Fleet Dashboard")
-st.caption("Live GPS telemetry and fleet monitoring dashboard."")
+st.caption("Live GPS telemetry and fleet monitoring dashboard.")
 
 # ---------------- SIDEBAR ----------------
 st.sidebar.header("🛰️ Fleet Monitoring")
