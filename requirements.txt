@@ -9,3 +9,4 @@ plotly==5.22.0
 pyarrow==16.1.0
 setuptools
 psutil==6.0.0
+python-dotenv==1.0.1
