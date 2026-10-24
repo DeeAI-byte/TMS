@@ -18,17 +18,17 @@ try:
 except Exception:  # fall back to st.map()
     HAS_FOLIUM = False
 
-st.set_page_config(page_title="MSB Track | Live Fleet", page_icon="🛰️", layout="wide")
+st.set_page_config(page_title="Live Fleet Dashboard", page_icon="🛰️", layout="wide")
 require_dashboard_password()
 st.markdown("<style>.block-container { padding-top: 1rem; padding-bottom: 0.5rem; }</style>", unsafe_allow_html=True)
 
 REFRESH_SECONDS = 60
 
-st.title("🛰️ MSB Track — Live Fleet Dashboard")
-st.caption("Live GPS telemetry for the SLMG Beverage fleet, pulled from MSB Track.")
+st.title("🛰️ Live Fleet Dashboard")
+st.caption("Live GPS telemetry and fleet monitoring dashboard."")
 
 # ---------------- SIDEBAR ----------------
-st.sidebar.header("🛰️ MSB Track")
+st.sidebar.header("🛰️ Fleet Monitoring")
 auto_refresh = st.sidebar.toggle(f"Auto-refresh every {REFRESH_SECONDS}s", value=True, key="msb_auto_refresh")
 if st.sidebar.button("🔄 Refresh now", use_container_width=True, key="msb_refresh_now"):
     msb.load_fleet_snapshot.clear()
@@ -173,7 +173,7 @@ def dashboard():
     st.caption(f"Showing {len(view):,} of {len(fleet):,} vehicles")
     st.download_button(
         "⬇️ Export CSV", view[msb.LIVE_TABLE_COLUMNS].to_csv(index=False).encode("utf-8"),
-        file_name=f"msb_fleet_{snap['fetched_at'].strftime('%Y%m%d_%H%M')}.csv", mime="text/csv",
+        file_name=f"fleet_dashboard_{snap['fetched_at'].strftime('%Y%m%d_%H%M')}.csv", mime="text/csv",
         key="msb_csv_export",
     )
 
