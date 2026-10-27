@@ -80,8 +80,8 @@ DEFAULT_ENDPOINTS = {
     "vehicle_list": "/Home/GetVehicleList2?ORG_ID={org_id}",
     "vehicle_status": "/Home/GetVehicleStatus?OrgId={org_id}",
     "telemetry": "/Home/GetLatestDeviceData?TRACCARID={vehicle_id}&vORGID={org_id}",
-    "distance": "/Home/GetTotalDistance?OrgId={org_id}",
-    "overspeed": "/Home/GetOverspeed?OrgId={org_id}",
+    "distance": "/Admindashboard/GetTotalDistance?OrgId={org_id}",
+    "overspeed": "/Admindashboard/GetOverspeed?OrgId={org_id}",
 }
 
 DEFAULT_METHODS = {
